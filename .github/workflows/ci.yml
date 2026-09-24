@@ -1,0 +1,106 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  # Formatting, compilation with contract sizes, and every suite that runs
+  # against mocks or a locally deployed PoolManager. Needs no secret, so it
+  # runs on every pull request, including ones from forks.
+  unit:
+    name: fmt / build / unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # v4-hooks-public nests libraries nothing here compiles against; only
+      # its top level is needed. Every other dependency is initialised in full.
+      - name: init submodules
+        run: |
+          set -euo pipefail
+          for lib in forge-std openzeppelin-contracts permit2 v4-core v4-periphery; do
+            git submodule update --init --recursive "lib/${lib}"
+          done
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: forge fmt --check
+        run: forge fmt --check
+
+      # --sizes fails the build on an EIP-170 overflow instead of leaving it
+      # to a failed deployment.
+      - name: forge build
+        run: forge build --sizes
+
+      - name: forge test (unit, fuzz)
+        run: >
+          forge test -vvv
+          --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,EndToEnd,Invariants,PoolBypass,SwapRouter}.t.sol'
+
+      # The coverage build turns the optimizer off, which is where a function
+      # too deep for the stack first fails to compile.
+      - name: forge build (coverage profile)
+        run: forge build
+        env:
+          FOUNDRY_PROFILE: coverage
+
+  # The fork suites deploy the whole protocol against the real Uniswap v4 on
+  # Robinhood Chain at a pinned block. They need an archive endpoint, held in
+  # the ROBINHOOD_RPC_URL repository secret, which pull requests from forks
+  # cannot read; those are covered by the unit job above.
+  fork:
+    name: fork tests / coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: init submodules
+        run: |
+          set -euo pipefail
+          for lib in forge-std openzeppelin-contracts permit2 v4-core v4-periphery; do
+            git submodule update --init --recursive "lib/${lib}"
+          done
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: forge test (all suites)
+        run: forge test -vvv
+        env:
+          ROBINHOOD_RPC_URL: ${{ secrets.ROBINHOOD_RPC_URL }}
+
+      - name: forge coverage
+        run: forge coverage --ir-minimum --report summary --report lcov
+        env:
+          ROBINHOOD_RPC_URL: ${{ secrets.ROBINHOOD_RPC_URL }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
+          retention-days: 14

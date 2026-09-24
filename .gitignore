@@ -1,0 +1,19 @@
+# Foundry
+out/
+cache/
+broadcast/
+lcov.info
+
+# Secrets and local configuration
+.env
+.env.*
+
+# Local tooling
+.slither/
+.venv/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

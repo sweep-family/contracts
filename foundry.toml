@@ -1,0 +1,54 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+
+# The hook address is mined with CREATE2 over the exact creation code, so the
+# bytecode has to be deterministic: no metadata hash, and the optimizer settings
+# pinned here rather than varying per profile.
+bytecode_hash = "none"
+cbor_metadata = false
+
+fs_permissions = [{ access = "read", path = "./out" }]
+
+[profile.default.fuzz]
+runs = 512
+
+[profile.default.invariant]
+runs = 256
+depth = 64
+fail_on_revert = false
+
+# Deep runs before a release: `FOUNDRY_PROFILE=intense forge test`
+[profile.intense.fuzz]
+runs = 20000
+
+[profile.intense.invariant]
+runs = 2000
+depth = 256
+
+# `forge coverage` cannot use via_ir, so the source is written to fit the stack
+# without it. `FOUNDRY_PROFILE=coverage forge build` proves that it still does.
+[profile.coverage]
+optimizer = false
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"
+multiline_func_header = "attributes_first"
+
+[rpc_endpoints]
+robinhood = "${ROBINHOOD_RPC_URL}"
+robinhood_testnet = "${ROBINHOOD_TESTNET_RPC_URL}"

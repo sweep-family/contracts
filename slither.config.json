@@ -1,0 +1,8 @@
+{
+  "filter_paths": "lib|test|script",
+  "exclude_dependencies": true,
+  "exclude_informational": true,
+  "exclude_optimization": true,
+  "fail_on": "medium",
+  "detectors_to_exclude": "reentrancy-no-eth"
+}
