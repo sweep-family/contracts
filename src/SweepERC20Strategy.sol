@@ -47,6 +47,7 @@ contract SweepERC20Strategy is SweepDesk {
         uint256 resaleMultiplierBps;
         uint256 askDecayWindow;
         address owner;
+        address curve;
     }
 
     /// @notice The token this strategy buys.
@@ -60,6 +61,10 @@ contract SweepERC20Strategy is SweepDesk {
 
     /// @notice Bags currently on the shelf.
     uint256 public bagsHeld;
+
+    /// @notice The target tokens all held bags sum to — what the desk's balance must always
+    /// cover, checked after every external call that could have moved it.
+    uint256 public heldBagTokens;
 
     /// @notice What the protocol paid for each bag it holds, and when.
     mapping(uint256 bagId => Holding) public bags;
@@ -82,6 +87,7 @@ contract SweepERC20Strategy is SweepDesk {
 
         token = IERC20(config.token);
         bagSize = config.bagSize;
+        __SweepCurve_init(config.curve);
         __SweepDesk_init(config.burnRouter, config.resaleMultiplierBps, config.askDecayWindow);
 
         __SweepStrategy_init(
@@ -136,9 +142,11 @@ contract SweepERC20Strategy is SweepDesk {
 
         bags[bagId] = Holding({cost: cost, acquiredAt: block.timestamp});
         ++bagsHeld;
+        heldBagTokens += bagSize;
         _recordPurchase(cost);
 
         SafeTransferLib.safeTransferETH(msg.sender, cost);
+        _assertBagsIntact();
 
         emit BagBought(bagId, cost, msg.sender, askPrice(bagId));
     }
@@ -155,6 +163,12 @@ contract SweepERC20Strategy is SweepDesk {
      * would take the buyer's ETH, keep the bag, and destroy the listing in one transaction. With
      * the transfer checked and the function `nonReentrant`, the order of the clearing and the move
      * is convention rather than a guard: swapping them changes no observable outcome.
+     *
+     * @dev A `true` return is not proof of delivery, so the buyer's balance is measured across
+     * the send: `BagNotDelivered` unless it rose by at least `bagSize`, mirroring the buy side's
+     * check. A target that reports success and moves nothing would otherwise take the buyer's
+     * ETH and clear the bag from the books. A target that lies on `balanceOf` too is beyond any
+     * on-chain guard.
      */
     function sellTokens(uint256 bagId) external payable nonReentrant {
         Holding memory holding = bags[bagId];
@@ -163,10 +177,27 @@ contract SweepERC20Strategy is SweepDesk {
 
         delete bags[bagId];
         --bagsHeld;
+        heldBagTokens -= bagSize;
+        uint256 before = token.balanceOf(msg.sender);
         SafeTransferLib.safeTransfer(address(token), msg.sender, bagSize);
+        if (token.balanceOf(msg.sender) < before + bagSize) revert BagNotDelivered();
+        _assertBagsIntact();
         _recordSale(msg.value);
 
         emit BagSold(bagId, msg.value, msg.sender, holding.cost);
+    }
+
+    /**
+     * @dev Proves the desk's balance still covers every bag it holds, after any external call
+     * that could have moved it. The per-purchase delta check counts what one
+     * transferFrom delivered; it says nothing about a target token whose own transfer machinery
+     * — a pre-approved operator, a DN404 twin, a callback on the seller's payment — can move
+     * the desk's balance while control is outside. Without this, such a target empties the
+     * shelf while every bag stays listed, and the first honest buyer pays real ETH for a bag
+     * the desk no longer holds.
+     */
+    function _assertBagsIntact() private view {
+        if (token.balanceOf(address(this)) < heldBagTokens) revert InventoryBreached();
     }
 
     /// @notice The ask of every bag from the first to the last ever bought, zero where sold.

@@ -14,6 +14,7 @@ pragma solidity ^0.8.26;
 
 import {FixedPointMathLib} from "solady/src/utils/FixedPointMathLib.sol";
 import {SweepToken} from "./SweepToken.sol";
+import {ISweepFactory, ISweepHooked} from "./interfaces/ISweepFactory.sol";
 import {ISweepBurnRouter} from "./interfaces/ISweepBurnRouter.sol";
 import {ISweepFeeReceiver} from "./interfaces/ISweepFeeReceiver.sol";
 
@@ -39,6 +40,7 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
         address hook;
         address poolManager;
         address owner;
+        address curve;
     }
 
     /// @dev Scale of `rewardPerToken`. At 1e36 the floor in the accumulator loses under a wei per
@@ -91,12 +93,14 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
     mapping(address holder => uint256 amount) public owed;
 
     /// @notice Accounts that hold the token without being holders: the pool, the dead address,
-    /// the hook, the router, the desk. Fixed at initialisation; there is no setter, because an
-    /// exclusion added later is how a rewards token is quietly rugged.
+    /// the hook, the router, the desk, the launch's curve, and the factory (which holds the
+    /// whole supply for one transaction at graduation). Fixed at initialisation; there is no
+    /// setter, because an exclusion added later is how a rewards token is quietly rugged.
     mapping(address account => bool excluded) public excludedFromRewards;
 
     error NothingToDistribute();
     error Excluded();
+    error RouterNotListed();
 
     event FeesReceived(uint256 amount, uint256 pending);
     event RewardsDistributed(uint256 ethSpent, uint256 tokensBought, uint256 eligibleSupply);
@@ -120,8 +124,11 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
         excludedFromRewards[config.hook] = true;
         excludedFromRewards[config.burnRouter] = true;
         excludedFromRewards[address(this)] = true;
+        excludedFromRewards[config.curve] = true;
+        excludedFromRewards[msg.sender] = true;
         isDistributor[address(this)] = true;
 
+        __SweepCurve_init(config.curve);
         __SweepToken_init(config.name, config.symbol, config.hook, config.poolManager, config.owner);
     }
 
@@ -209,10 +216,14 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
         emit RewardMinUpdated(minimum);
     }
 
-    /// @notice Points the buyback at a different router, which is excluded from rewards like the
-    /// one before it. The old router stays excluded: it never held a holder's share.
+    /// @notice Points the buyback at a different router, which must be one the factory lists and
+    /// is excluded from rewards like the one before it. The old router stays excluded: it never
+    /// held a holder's share.
+    /// @dev The factory gate exists for the same reason as on the desks: without it this setter
+    /// sends every pending distribution to an arbitrary address. Reached through the hook's
+    /// immutable factory address; the zero address is never listed.
     function setBurnRouter(address router) external onlyOwner {
-        if (router == address(0)) revert InvalidConfiguration();
+        if (!ISweepFactory(ISweepHooked(hook).factory()).isRouter(router)) revert RouterNotListed();
         burnRouter = router;
         excludedFromRewards[router] = true;
         emit BurnRouterUpdated(router);

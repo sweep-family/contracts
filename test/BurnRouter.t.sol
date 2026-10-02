@@ -54,13 +54,17 @@ contract BurnRouterTest is SweepForkTest {
 
         assertGt(s.balanceOf(DEAD), deadBefore, "nothing reached the dead address");
         assertEq(s.circulatingSupply(), circulatingBefore - (s.balanceOf(DEAD) - deadBefore));
-        assertEq(spent + reward, pending);
-        assertEq(s.pendingBurn(), 0);
+        uint256 pass = pending < s.burnIncrement() ? pending : s.burnIncrement();
+        assertEq(spent + reward, pass);
+        assertEq(s.pendingBurn(), pending - pass);
     }
 
     /// @notice The burn goes through the pool, the pool names the hook, and the router is not the
     /// hook — so the burn pays the fee, and eighty percent of it comes straight back as treasury.
     /// A number, not a sentence: the treasury rises during a burn with no trade having happened.
+    /// @dev The tolerance is 6%, not exact: since graduation the pool carries the curve's
+    /// 4.2 ETH of real depth rather than the old bottomless single-sided ramp, so the burn's own
+    /// swap moves the price it converts its fee at by a visible amount.
     function test_BurnPaysTheHookFeeAndRecyclesEightyPercentOfIt() public {
         uint256 treasuryBefore = s.treasury();
         uint256 protocolBefore = hook.accruedFees(feeTo);
@@ -76,7 +80,7 @@ contract BurnRouterTest is SweepForkTest {
         assertGt(fee, 0, "the burn paid no fee");
         assertEq(toTreasury, (fee * 80) / 100, "the treasury did not get its eighty percent");
         assertEq(toCreator, (fee * 10) / 100, "the collection did not get its tenth");
-        assertApproxEqRel(fee, spent / 10, 0.02e18, "the fee is not a tenth of the burn");
+        assertApproxEqRel(fee, spent / 10, 0.06e18, "the fee is not a tenth of the burn");
     }
 
     /// @notice The hook's invariant, read from inside the transaction: the router takes to itself

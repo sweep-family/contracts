@@ -43,6 +43,29 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
     /// nominally in place, which is worse than removing it because it still reads as working.
     uint256 public constant MAX_BURN_COOLDOWN = 1 days;
 
+    /// @notice Largest burn pass the owner may set.
+    /// @dev The graduated pool's depth is fixed at its ~4.2 ETH seed, and the burn swap takes
+    /// the pool's price as it finds it. On a fork, a one-transaction sandwich around a pass
+    /// turned a profit from about 0.33 ETH up; this bound sits below it.
+    uint256 public constant MAX_BURN_INCREMENT = 0.25 ether;
+
+    /// @notice Slowest ramp the owner may set, mirroring the factory's launch gate: below it the
+    /// bid never reaches a floor price within any useful horizon and the machine looks alive
+    /// while being unable to buy anything.
+    uint256 public constant MIN_BID_INCREASE_PER_SECOND = 0.000_001 ether;
+
+    /// @notice Fastest ramp the owner may set, mirroring the factory's launch gate: above it the
+    /// reverse auction resolves faster than anyone can watch it.
+    uint256 public constant MAX_BID_INCREASE_PER_SECOND = 0.01 ether;
+
+    /// @notice Highest ceiling the owner may ever set. The launch gate bounds what a stranger
+    /// types; this bounds what the owner can do afterwards, which is the promise that the bid
+    /// can never be pointed at a whole treasury in one move.
+    uint256 public constant MAX_BID_CAP = 100 ether;
+
+    /// @notice How long the owner must wait between raises of either bid parameter.
+    uint256 public constant BID_RAISE_COOLDOWN = 7 days;
+
     /// @notice How fast the published bid climbs, per second of waiting.
     /// @dev Per second rather than per block. Block time is a property of the chain: Robinhood
     /// Chain produces one every ~101 ms, so a block-paced ramp climbs 119x faster here than on
@@ -60,6 +83,10 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
 
     /// @notice When the last purchase happened, which is where the ramp restarts.
     uint256 public lastPurchaseAt;
+
+    /// @notice When the owner last raised the bid ramp or its ceiling. Raises are paced by
+    /// `BID_RAISE_COOLDOWN`; lowering is always free and does not touch this clock.
+    uint256 public lastBidRaiseAt;
 
     /// @notice ETH available to buy assets with.
     uint256 public treasury;
@@ -91,6 +118,8 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
 
     error NothingToBurn();
     error BurnCooldownNotElapsed();
+    error BidRaiseTooLarge();
+    error BidRaiseTooSoon();
 
     event FeesReceived(uint256 amount, uint256 treasury);
     event SaleRecorded(uint256 proceeds, uint256 pendingBurn);
@@ -120,8 +149,23 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
         bidIncreasePerSecond = bidIncreasePerSecond_;
         maxBid = maxBid_;
 
-        burnIncrement = 1 ether;
+        burnIncrement = 0.1 ether;
         burnCooldown = 12;
+        lastPurchaseAt = block.timestamp;
+        lastBidRaiseAt = block.timestamp;
+    }
+
+    /**
+     * @notice The curve's graduation notice: restarts the bid ramp at the moment the machine
+     * actually starts.
+     *
+     * @dev Without this reset, a launch that spent days on its curve would open its desk with
+     * the ramp fully climbed, and the bid would jump to the ceiling the moment the first
+     * post-graduation fee funds the treasury — the desk would overpay for its very first piece
+     * by exactly the age of the curve. Restricted to the curve for the reason on the base
+     * declaration.
+     */
+    function markGraduated() external virtual override onlyCurve {
         lastPurchaseAt = block.timestamp;
     }
 
@@ -188,14 +232,30 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
      * set too low at launch leaves a strategy unable to ever buy anything: the treasury fills behind
      * a ceiling it can never cross, and the machine looks alive while doing nothing.
      *
-     * @dev The cap is also the protocol's only protection against overpaying, so a settable cap is
-     * a power over funds — the same category as `setDistributor`. Note that on an upgradeable proxy
-     * this grants nothing new: an owner who can replace the implementation can already do anything
-     * a setter would allow. The decision that actually carries weight is the upgradeability itself,
-     * not this function.
+     * @dev The cap is the protocol's only protection against overpaying, so a settable cap is a
+     * power over funds — the same category as `setDistributor` — and the strategies are not
+     * upgradeable, so this setter is the whole of that power. It is bounded three ways
+     *. The absolute bounds mirror the factory's launch gates, so the owner can
+     * never set what a launch could not have opened with. Raising either parameter is capped at
+     * double its current value and paced to once per `BID_RAISE_COOLDOWN`: without the pacing, a
+     * compromised owner walks the cap to the treasury in one transaction and drains it through a
+     * single sale; with it, every raise is a public event days ahead of the money it could ever
+     * move. Lowering is always free, because a lower bid endangers nobody, and it must never
+     * consume the raise clock or an owner de-risking a strategy would lock themselves out of
+     * re-tuning it.
      */
     function setBidParameters(uint256 increasePerSecond, uint256 cap) external onlyOwner {
-        if (increasePerSecond == 0 || cap == 0) revert InvalidConfiguration();
+        if (
+            increasePerSecond < MIN_BID_INCREASE_PER_SECOND || increasePerSecond > MAX_BID_INCREASE_PER_SECOND
+                || cap == 0 || cap > MAX_BID_CAP
+        ) {
+            revert InvalidConfiguration();
+        }
+        if (increasePerSecond > bidIncreasePerSecond || cap > maxBid) {
+            if (increasePerSecond > bidIncreasePerSecond * 2 || cap > maxBid * 2) revert BidRaiseTooLarge();
+            if (block.timestamp < lastBidRaiseAt + BID_RAISE_COOLDOWN) revert BidRaiseTooSoon();
+            lastBidRaiseAt = block.timestamp;
+        }
         bidIncreasePerSecond = increasePerSecond;
         maxBid = cap;
         emit BidParametersUpdated(increasePerSecond, cap);
@@ -211,11 +271,13 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
      * @dev Both bounds are load-bearing. A zero increment makes every pass a no-op that still
      * consumes the cooldown, freezing the queue while appearing to work. A zero cooldown lets a
      * whole queue drain inside one block, which is the single market order the pacing exists to
-     * prevent. And an unbounded cooldown would let this setter switch the burn off while leaving it
-     * nominally in place, which reads as working and is therefore worse than removing it.
+     * prevent. An increment above `MAX_BURN_INCREMENT` makes each pass worth sandwiching on the
+     * graduated pool's fixed ~4.2 ETH depth. And an unbounded cooldown would let this setter
+     * switch the burn off while leaving it nominally in place, which reads as working and is
+     * therefore worse than removing it.
      */
     function setBurnPacing(uint256 increment, uint256 cooldown) external onlyOwner {
-        if (increment == 0 || cooldown == 0 || cooldown > MAX_BURN_COOLDOWN) {
+        if (increment == 0 || increment > MAX_BURN_INCREMENT || cooldown == 0 || cooldown > MAX_BURN_COOLDOWN) {
             revert InvalidConfiguration();
         }
         burnIncrement = increment;

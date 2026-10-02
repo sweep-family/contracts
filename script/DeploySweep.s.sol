@@ -14,6 +14,7 @@ import {SweepNFTStrategyFactory} from "../src/SweepNFTStrategyFactory.sol";
 import {SweepHook} from "../src/SweepHook.sol";
 import {SweepBurnRouter} from "../src/SweepBurnRouter.sol";
 import {SweepSwapRouter} from "../src/SweepSwapRouter.sol";
+import {SweepBondingCurve} from "../src/SweepBondingCurve.sol";
 import {ISweepFactory} from "../src/interfaces/ISweepFactory.sol";
 import {UniswapV4Addresses} from "./config/UniswapV4Addresses.sol";
 
@@ -31,12 +32,18 @@ import {UniswapV4Addresses} from "./config/UniswapV4Addresses.sol";
  * factory that already has one. That is the intent — every strategy already launched has that hook
  * welded into the identity of the pool it trades on.
  *
- * @dev The two routers are admitted to the factory's swap allow-list here, and they are the only
- * two a deploy ever adds. The hook refuses a swap whose caller is not on that list, which is what
- * keeps ERC-6909 claims on a strategy's token from ever existing —
- * both of these settle in ERC-20 and consume the hook's transient allowance exactly. The burn
- * router is added by `setBurnRouter` itself; the swap router is added by name. Anything else added
- * later is an owner decision to be read as carefully as a `setDistributor`.
+ * @dev The two routers are admitted to the factory's swap allow-list here — permanently: with a
+ * transfer-locked token they are the only market, so a deploy freezes them in and no owner, honest
+ * or compromised, can ever delist them. The hook refuses a swap whose caller is not on that list,
+ * which is what keeps ERC-6909 claims on a strategy's token from ever existing — both of these
+ * settle in ERC-20 and consume the hook's transient allowance exactly. Anything else added later
+ * is an owner decision to be read as carefully as a `setDistributor`.
+ *
+ * @dev The wiring runs with the BROADCASTER as the factory's owner and hands ownership to
+ * `SWEEP_OWNER` as the very last step. Every wiring call is `onlyOwner`, so a factory born owned
+ * by a Safe could never be wired by the deploying wallet at all; and a strategy launched before
+ * the handover would be owned by the deployer forever, which is why the transfer happens inside
+ * this same script rather than as a step someone remembers later.
  *
  * @dev Run with `--slow`. Each step here depends on the receipt of the one before, and `forge
  * script` does not wait for receipts otherwise, and a step sent before its predecessor lands fails.
@@ -55,14 +62,16 @@ contract DeploySweep is Script {
      * @notice Deploys the implementation, the factory and the hook, and wires them together.
      *
      * @dev `SWEEP_FEE_RECIPIENT` receives both the launch fee and the protocol's tenth of every
-     * trading fee. `SWEEP_OWNER` owns the factory and, through it, every strategy it launches.
+     * trading fee, on pools and on curves alike. `SWEEP_OWNER` — the Safe, on mainnet — ends up
+     * owning the factory and, through it, every strategy it launches, but only after the wiring:
+     * see the contract doc for why the handover is last.
      *
      * @dev The burn router is deployed after the hook because it reads the hook off the factory,
      * and set on the factory before any launch because a strategy holds its router from birth. The
      * swap router is the wallet's road onto the pool; it is not wired into anything, the front end
-     * simply calls it. `SWEEP_LAUNCH_FEE` overrides the factory's default, which a testnet with a
-     * thin faucet has reason to; it is only applied when the deployer is the owner, since the
-     * setter is theirs.
+     * simply calls it. The curve implementation is what every launch clones its market from, and
+     * the factory refuses one whose economics disagree with its own. `SWEEP_LAUNCH_FEE` overrides
+     * the factory's default, which a testnet with a thin faucet has reason to.
      */
     function run()
         external
@@ -83,8 +92,9 @@ contract DeploySweep is Script {
         vm.startBroadcast();
 
         implementation = address(new SweepNFTStrategy());
-        factory =
-            new SweepNFTStrategyFactory(positionManager, permit2, poolManager, implementation, feeRecipient, owner);
+        factory = new SweepNFTStrategyFactory(
+            positionManager, permit2, poolManager, implementation, feeRecipient, msg.sender
+        );
 
         bytes memory args = abi.encode(IPoolManager(poolManager), ISweepFactory(address(factory)), feeRecipient);
         (address expected, bytes32 salt) = HookMiner.find(CREATE2_DEPLOYER, FLAGS, type(SweepHook).creationCode, args);
@@ -97,14 +107,18 @@ contract DeploySweep is Script {
         burnRouter = new SweepBurnRouter(IPoolManager(poolManager), ISweepFactory(address(factory)));
         factory.setBurnRouter(address(burnRouter));
         swapRouter = new SweepSwapRouter(IPoolManager(poolManager), ISweepFactory(address(factory)));
-        factory.setRouter(address(swapRouter), true);
+        factory.setRouterPermanent(address(swapRouter));
+        factory.setCurveImplementation(address(new SweepBondingCurve()));
         factory.setERC20Implementation(address(new SweepERC20Strategy()));
         factory.setRecursiveImplementation(address(new SweepRecursiveStrategy()));
         if (launchFee != factory.launchFee()) factory.setLaunchFee(launchFee, feeRecipient);
+        if (owner != msg.sender) factory.transferOwnership(owner);
 
         vm.stopBroadcast();
 
         console2.log("chain           ", block.chainid);
+        console2.log("owner           ", factory.owner());
+        console2.log("curve impl      ", factory.curveImplementation());
         console2.log("implementation  ", implementation);
         console2.log("erc20 impl      ", factory.erc20Implementation());
         console2.log("recursive impl  ", factory.recursiveImplementation());
@@ -113,7 +127,10 @@ contract DeploySweep is Script {
         console2.log("hook flag bits  ", uint160(address(hook)) & 0x3FFF);
         console2.log("burn router     ", address(burnRouter));
         console2.log("swap router     ", address(swapRouter));
-        console2.log("routers allowed ", factory.isRouter(address(swapRouter)) && factory.isRouter(address(burnRouter)));
+        console2.log(
+            "routers frozen  ",
+            factory.isPermanentRouter(address(swapRouter)) && factory.isPermanentRouter(address(burnRouter))
+        );
         console2.log("launch fee wei  ", factory.launchFee());
         console2.logBytes32(salt);
     }

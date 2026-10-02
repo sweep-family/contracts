@@ -14,6 +14,7 @@ import {SweepHook} from "../src/SweepHook.sol";
 import {SweepBurnRouter} from "../src/SweepBurnRouter.sol";
 import {ISweepFactory} from "../src/interfaces/ISweepFactory.sol";
 import {SweepForkTest} from "./shared/SweepForkTest.sol";
+import {SweepBondingCurve} from "../src/SweepBondingCurve.sol";
 import {TargetToken, OwnerlessTargetToken} from "./mocks/TargetToken.sol";
 
 /**
@@ -184,7 +185,7 @@ contract FactoryERC20Test is SweepForkTest {
     function test_LaunchEmitsTheBag() public {
         vm.expectEmit(true, false, true, false, address(factory));
         emit SweepNFTStrategyFactory.ERC20StrategyLaunched(
-            address(target), address(0), trader, "Target Sweep", "sTGT", 0, SUPPLY / 1000
+            address(target), address(0), trader, "Target Sweep", "sTGT", address(0), SUPPLY / 1000
         );
         _launchERC20();
     }
@@ -196,6 +197,23 @@ contract FactoryERC20Test is SweepForkTest {
         address strategy = _launchERC20();
         assertEq(hook.creatorFeeRecipient(strategy), address(this), "the token's owner was not registered");
         assertTrue(hook.creatorFeeRecipient(strategy) != trader);
+    }
+
+    /// @notice On a bag desk the launcher and the creator recipient are two different wallets —
+    /// the sender, and the target token's owner — and the curve exempts both from the snipe tax.
+    /// Before, only the recipient was, so whoever launched a bag desk paid 99% on their own first
+    /// buy.
+    function test_ABagLaunchExemptsBothTheLauncherAndTheTokenOwner() public {
+        vm.prank(trader);
+        address strategy =
+            factory.launchERC20{value: LAUNCH_FEE}(address(target), "Target Sweep", "sTGT", BID_PER_SECOND, MAX_BID);
+        SweepBondingCurve curve = SweepBondingCurve(payable(factory.curveOf(strategy)));
+
+        assertEq(curve.launcher(), trader, "the launcher is the sender");
+        assertEq(curve.creatorFeeRecipient(), address(this), "the recipient is the token's owner");
+        assertEq(curve.currentSnipeTaxBps(trader), 0, "the launcher paid the snipe tax");
+        assertEq(curve.currentSnipeTaxBps(address(this)), 0, "the token owner paid the snipe tax");
+        assertEq(curve.currentSnipeTaxBps(whale), 9900, "a stranger was exempted");
     }
 
     /// @notice A renounced token has nobody to pay, and the share falls through to the protocol.
@@ -292,7 +310,7 @@ contract FactoryERC20Test is SweepForkTest {
         uint256 deadBefore = strategy.balanceOf(strategy.DEAD_ADDRESS());
         vm.warp(block.timestamp + 1 minutes);
         (uint256 spent, uint256 reward) = strategy.processBurn();
-        assertEq(spent + reward, ask);
+        assertEq(spent + reward, ask < strategy.burnIncrement() ? ask : strategy.burnIncrement());
         assertGt(strategy.balanceOf(strategy.DEAD_ADDRESS()), deadBefore, "nothing was burnt");
         assertEq(address(strategy).balance, strategy.treasury() + strategy.pendingBurn(), "conservation");
     }
@@ -303,6 +321,7 @@ contract FactoryERC20Test is SweepForkTest {
         vm.prank(trader);
         strategy =
             factory.launchERC20{value: LAUNCH_FEE}(address(target), "Target Sweep", "sTGT", BID_PER_SECOND, MAX_BID);
+        _graduate(strategy);
     }
 
     function _keyFor(address strategy) private view returns (PoolKey memory) {

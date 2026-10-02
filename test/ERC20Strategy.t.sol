@@ -2,6 +2,10 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {LibClone} from "solady/src/utils/LibClone.sol";
+import {MockStrategyHook} from "./mocks/MockStrategyHook.sol";
+import {BagThiefSeller, OperatorBagToken} from "./mocks/OperatorAttack.sol";
+import {MockSweepFactory} from "./mocks/MockSweepFactory.sol";
 
 import {SweepStrategy} from "../src/SweepStrategy.sol";
 import {SweepToken} from "../src/SweepToken.sol";
@@ -25,7 +29,9 @@ contract ERC20StrategyTest is Test {
     TargetToken internal target;
     MockBurnRouter internal router;
 
-    address internal hook = makeAddr("hook");
+    MockSweepFactory internal mockFactory = new MockSweepFactory(address(this));
+    address internal hook = address(new MockStrategyHook(address(mockFactory), makeAddr("protocol")));
+    address internal curveAddr = makeAddr("curve");
     address internal poolManager = makeAddr("poolManager");
     address internal owner = makeAddr("owner");
     address internal seller = makeAddr("seller");
@@ -58,26 +64,26 @@ contract ERC20StrategyTest is Test {
     /* ───────────────────────── initialisation ──────────────────────── */
 
     function test_InitializeRefusesAZeroToken() public {
-        SweepERC20Strategy fresh = new SweepERC20Strategy();
+        SweepERC20Strategy fresh = SweepERC20Strategy(payable(LibClone.clone(address(new SweepERC20Strategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(_config(address(0), BAG, address(router), MULTIPLIER, 0));
     }
 
     function test_InitializeRefusesAnEmptyBag() public {
-        SweepERC20Strategy fresh = new SweepERC20Strategy();
+        SweepERC20Strategy fresh = SweepERC20Strategy(payable(LibClone.clone(address(new SweepERC20Strategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(_config(address(target), 0, address(router), MULTIPLIER, 0));
     }
 
     function test_InitializeRefusesAZeroRouter() public {
-        SweepERC20Strategy fresh = new SweepERC20Strategy();
+        SweepERC20Strategy fresh = SweepERC20Strategy(payable(LibClone.clone(address(new SweepERC20Strategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(_config(address(target), BAG, address(0), MULTIPLIER, 0));
     }
 
     /// @notice A multiplier under 100% would list a bag below what it cost, a loss on every cycle.
     function test_InitializeRefusesAMultiplierBelowCost() public {
-        SweepERC20Strategy fresh = new SweepERC20Strategy();
+        SweepERC20Strategy fresh = SweepERC20Strategy(payable(LibClone.clone(address(new SweepERC20Strategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(_config(address(target), BAG, address(router), 9999, 0));
     }
@@ -409,7 +415,7 @@ contract ERC20StrategyTest is Test {
         strategy.sellTokens{value: 1.4 ether}(bagId);
 
         uint256 pass = strategy.burnIncrement();
-        assertEq(pass, 1 ether);
+        assertEq(pass, 0.1 ether);
         uint256 deadBefore = strategy.balanceOf(strategy.DEAD_ADDRESS());
         (uint256 spent, uint256 reward) = strategy.processBurn();
 
@@ -417,7 +423,7 @@ contract ERC20StrategyTest is Test {
         assertEq(reward, (pass * strategy.BURN_CALLER_REWARD_BPS()) / strategy.BPS());
         assertEq(router.ethReceived(), spent);
         assertGt(strategy.balanceOf(strategy.DEAD_ADDRESS()), deadBefore);
-        assertEq(strategy.pendingBurn(), 0.4 ether);
+        assertEq(strategy.pendingBurn(), 1.3 ether);
         assertEq(target.balanceOf(address(strategy)), 0);
     }
 
@@ -454,6 +460,55 @@ contract ERC20StrategyTest is Test {
         assertEq(target.balanceOf(address(strategy)), strategy.bagsHeld() * BAG);
     }
 
+    /* the closing balance assertion */
+
+    /**
+     * @notice A seller whose payment hook lifts the desk's held bags through the target token's
+     * pre-approved operator passes the per-purchase delta check — it measures one transferFrom,
+     * not the shelf — and is caught only by the closing assertion that the balance still covers
+     * every held bag. This is the DN404 / conduit shape of the attack.
+     */
+    function test_ASellerWhosePaymentHookDrainsTheShelfIsRefused() public {
+        OperatorBagToken obag = new OperatorBagToken();
+        SweepERC20Strategy s = _deploy(address(obag), BAG, 0);
+        vm.prank(hook);
+        s.addFees{value: 10 ether}();
+
+        obag.mint(seller, BAG);
+        vm.startPrank(seller);
+        obag.approve(address(s), type(uint256).max);
+        vm.warp(block.timestamp + 200);
+        s.buyTokens();
+        vm.stopPrank();
+        assertEq(s.heldBagTokens(), BAG);
+
+        BagThiefSeller thief = new BagThiefSeller(obag, address(s), makeAddr("fence"));
+        obag.setGlobalOperator(address(thief));
+        obag.mint(address(thief), BAG);
+        thief.approveDesk(BAG);
+        vm.warp(block.timestamp + 200);
+
+        vm.expectRevert(SweepDesk.InventoryBreached.selector);
+        thief.sellBag();
+
+        assertEq(obag.balanceOf(address(s)), BAG, "the drained bags did not come back with the revert");
+    }
+
+    /// @notice The held-bag ledger follows buys and sells exactly; it is the number the closing
+    /// assertion measures the balance against.
+    function test_HeldBagTokensFollowTheShelf() public {
+        _fund(5 ether);
+        vm.warp(block.timestamp + 200);
+        vm.prank(seller);
+        uint256 bagId = strategy.buyTokens();
+        assertEq(strategy.heldBagTokens(), BAG);
+
+        uint256 ask = strategy.askPrice(bagId);
+        vm.prank(buyer);
+        strategy.sellTokens{value: ask}(bagId);
+        assertEq(strategy.heldBagTokens(), 0);
+    }
+
     /* ───────────────────────────── helpers ──────────────────────────── */
 
     function _fund(uint256 amount) private {
@@ -469,7 +524,7 @@ contract ERC20StrategyTest is Test {
     }
 
     function _deploy(address token, uint256 bag, uint256 decayWindow) private returns (SweepERC20Strategy desk) {
-        desk = new SweepERC20Strategy();
+        desk = SweepERC20Strategy(payable(LibClone.clone(address(new SweepERC20Strategy()))));
         desk.initialize(_config(token, bag, address(router), MULTIPLIER, decayWindow));
     }
 
@@ -490,6 +545,7 @@ contract ERC20StrategyTest is Test {
         config.resaleMultiplierBps = multiplierBps;
         config.askDecayWindow = decayWindow;
         config.owner = owner;
+        config.curve = curveAddr;
     }
 }
 

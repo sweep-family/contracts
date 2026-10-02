@@ -59,6 +59,21 @@ contract SwapRouterTest is SweepForkTest {
         assertEq(address(router).balance, 0, "the router kept ETH");
     }
 
+    /// @notice A buy refunds the caller's own unspent ETH and nothing else.
+    /// @dev The refund used to be
+    /// the router's whole balance, so ETH force-sent to the router — by `selfdestruct`, which no
+    /// `receive` can refuse — went to whoever bought next, a race only a bot wins.
+    function test_BuyRefundsOnlyTheCallersOwnChange() public {
+        vm.deal(address(router), 1 ether);
+        uint256 before = trader.balance;
+
+        vm.prank(trader);
+        router.buy{value: 0.1 ether}(address(s), 0, block.timestamp);
+
+        assertEq(address(router).balance, 1 ether, "the stray ETH went to the buyer");
+        assertGe(before - trader.balance, 0.1 ether - 1, "the buyer was refunded more than their change");
+    }
+
     /// @notice A sell pulls the tokens from the wallet on an ordinary approval and delivers ETH.
     function test_SellDeliversEthToTheWallet() public {
         vm.prank(trader);

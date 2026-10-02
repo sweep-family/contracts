@@ -30,6 +30,10 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 import {SweepNFTStrategy} from "./SweepNFTStrategy.sol";
 import {SweepERC20Strategy} from "./SweepERC20Strategy.sol";
 import {SweepRecursiveStrategy} from "./SweepRecursiveStrategy.sol";
+import {SweepBondingCurve} from "./SweepBondingCurve.sol";
+import {SweepGraduationMath} from "./libraries/SweepGraduationMath.sol";
+import {ISweepBondingCurve, ISweepCurveToken} from "./interfaces/ISweepBondingCurve.sol";
+import {FixedPointMathLib} from "solady/src/utils/FixedPointMathLib.sol";
 import {ISweepFactory} from "./interfaces/ISweepFactory.sol";
 import {ISweepHookRegistry} from "./interfaces/ISweepHookRegistry.sol";
 import {IOwnable} from "./interfaces/IOwnable.sol";
@@ -37,13 +41,17 @@ import {IOwnable} from "./interfaces/IOwnable.sol";
 /**
  * @title SweepNFTStrategyFactory
  * @author 0xDAVZER
- * @notice Turns a collection into a market: one token, one pool, one position, in one transaction.
+ * @notice Turns a collection into a market: one token, one curve at launch, one pool at
+ * graduation.
  *
- * @dev The launch pushes the entire supply into a single Uniswap v4 position whose price opens at
- * the very top of its range. At the top of a range a position holds only the upper currency, which
- * here is the token — so the pool needs no ETH to exist, and a market opens with no capital. Buyers
- * walk the price down through the range and leave their ETH behind as they go. That position *is*
- * the bonding curve, and its ownership NFT is minted to the dead address, so nobody can withdraw it.
+ * @dev A launch deploys the strategy — which is the token — and moves its entire supply onto a
+ * `SweepBondingCurve` clone, where it trades against a virtual reserve until 4.2 ETH of real ETH
+ * has come in. `createGraduatedPool`, permissionless, then takes the curve's reserves and opens
+ * the Uniswap v4 pool at the curve's exact final price: a full-range position seeded with all
+ * the swept ETH and the reserved token allocation, its ownership NFT minted to the dead address
+ * so nobody can ever withdraw it, and the excess tokens burnt the same way. Reserves move from
+ * curve to pool in one transaction, so there is no swept-but-unpooled state and no rescue path
+ *.
  *
  * @dev Anyone may launch on anything, for the fee. There is no allowlist and no gate on the
  * collection's own `owner()`: a gate on `owner()` would exclude every collection that renounced it
@@ -72,15 +80,13 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
 
     int24 public constant TICK_SPACING = 60;
 
-    /// @notice Where the price opens, and the top of the launch position's range.
-    ///
-    /// @dev This single number sets the opening valuation. At tick 175020 the pool starts at
-    /// 39,869,610 tokens per ETH, so a billion tokens is an opening FDV of about 25.08 ETH.
-    ///
-    /// @dev The starting price is derived from this tick rather than stored beside it. A hardcoded
-    /// price can sit above its own range, leaving a dead zone with no liquidity that the first buy
-    /// crosses instantly; deriving it makes the price and the top of the range the same number.
-    int24 public constant TICK_UPPER = 175_020;
+    /// @notice The curve's virtual reserve, mirrored so graduation can split the reserves with
+    /// the same number the curve priced them with. `setCurveImplementation` refuses an
+    /// implementation whose constant disagrees, so the mirror cannot drift.
+    uint256 public constant PHANTOM_QUOTE = 1.68 ether;
+
+    /// @notice The curve's graduation threshold, mirrored and verified the same way.
+    uint256 public constant GRADUATION_THRESHOLD = 4.2 ether;
 
     /// @notice Slowest bid ramp a launch may choose: about 0.0036 ETH an hour.
     /// @dev Below this a strategy's published bid never reaches a floor price within any useful
@@ -162,7 +168,23 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      */
     mapping(address router => bool allowed) public isRouter;
 
-    /// @notice The position NFT each launch minted to the dead address.
+    /// @notice The implementation every launch's bonding curve is cloned from.
+    address public curveImplementation;
+
+    /// @notice Each strategy's launch market.
+    mapping(address strategy => address curve) public curveOf;
+
+    /// @notice The strategy behind a curve — nonzero exactly for curves this factory deployed,
+    /// which is what the `receive` gate reads.
+    mapping(address curve => address strategy) public strategyOfCurve;
+
+    /// @notice Routers that can never be delisted. The base swap and burn
+    /// routers live here, so no owner — honest or compromised — can freeze trading on a token
+    /// whose transfer lock makes these routers the only market.
+    mapping(address router => bool permanent) public isPermanentRouter;
+
+    /// @notice The position NFT each graduation minted to the dead address. Zero until the
+    /// strategy graduates, which is how "not yet pooled" is spelled.
     mapping(address strategy => uint256 tokenId) public positionIdOf;
 
     error HookNotSet();
@@ -176,6 +198,12 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     error NotERC20();
     error InvalidBag();
     error RecursiveImplementationNotSet();
+    error CurveImplementationNotSet();
+    error CurveEconomicsMismatch();
+    error RouterPermanent();
+    error UnknownStrategy();
+    error AlreadyPooled();
+    error DirectPaymentRejected();
 
     event StrategyLaunched(
         address indexed collection,
@@ -183,7 +211,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         address indexed launcher,
         string name,
         string symbol,
-        uint256 positionId,
+        address curve,
         bool verified
     );
     event ERC20StrategyLaunched(
@@ -192,12 +220,23 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         address indexed launcher,
         string name,
         string symbol,
-        uint256 positionId,
+        address curve,
         uint256 bagSize
     );
     event RecursiveStrategyLaunched(
-        address indexed strategy, address indexed launcher, string name, string symbol, uint256 positionId
+        address indexed strategy, address indexed launcher, string name, string symbol, address curve
     );
+    event StrategyGraduated(
+        address indexed strategy,
+        address indexed curve,
+        uint256 positionId,
+        uint256 pooledEth,
+        uint256 pooledTokens,
+        uint256 burnedTokens,
+        uint160 sqrtPriceX96
+    );
+    event CurveImplementationSet(address indexed implementation);
+    event RouterMadePermanent(address indexed router);
     event HookSet(address indexed hook);
     event BurnRouterSet(address indexed router);
     event StrategyImplementationSet(address indexed implementation);
@@ -207,7 +246,9 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     event LaunchFeeSet(uint256 fee, address indexed recipient);
     event ResaleMultiplierSet(uint256 multiplierBps);
 
-    /// @notice Wires the factory to Uniswap and to the implementation it clones.
+    /// @notice Wires the factory to Uniswap and to the implementation it clones, and proves the
+    /// constant curve economics can seed a v4 pool at all — a misbuilt deployment fails here, at
+    /// deploy time, rather than at the first stranger's graduation.
     /// @dev The hook is deliberately absent. Its address encodes its permissions and is mined over
     /// an initcode containing this factory's address, so it cannot exist yet — see `setHook`.
     constructor(
@@ -232,6 +273,14 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         launchFeeRecipient = launchFeeRecipient_;
 
         _initializeOwner(owner_);
+
+        uint256 supply = SweepNFTStrategy(payable(strategyImplementation_)).MAX_SUPPLY();
+        uint256 reserved = FixedPointMathLib.fullMulDiv(supply, PHANTOM_QUOTE, PHANTOM_QUOTE + GRADUATION_THRESHOLD);
+        SweepGraduationMath.assertSeedable(
+            TICK_SPACING,
+            GRADUATION_THRESHOLD,
+            FixedPointMathLib.fullMulDiv(reserved, GRADUATION_THRESHOLD, PHANTOM_QUOTE + GRADUATION_THRESHOLD)
+        );
     }
 
     /**
@@ -338,12 +387,11 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         _validateLaunch(collection, bidIncreasePerSecond, maxBid);
         address collectionOwner = _collectionOwner(collection);
 
-        strategy = _deployStrategy(collection, name_, symbol_, bidIncreasePerSecond, maxBid);
-        _open(collection, strategy, creatorFeeRecipient);
+        address curve = _deployCurve();
+        strategy = _deployStrategy(collection, name_, symbol_, bidIncreasePerSecond, maxBid, curve);
+        _open(collection, strategy, curve, creatorFeeRecipient);
 
-        emit StrategyLaunched(
-            collection, strategy, msg.sender, name_, symbol_, positionIdOf[strategy], collectionOwner == msg.sender
-        );
+        emit StrategyLaunched(collection, strategy, msg.sender, name_, symbol_, curve, collectionOwner == msg.sender);
     }
 
     /**
@@ -426,12 +474,11 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     {
         _validateERC20Launch(terms);
 
-        strategy = _deployERC20Strategy(terms, name_, symbol_);
-        _open(terms.token, strategy, terms.creatorFeeRecipient);
+        address curve = _deployCurve();
+        strategy = _deployERC20Strategy(terms, name_, symbol_, curve);
+        _open(terms.token, strategy, curve, terms.creatorFeeRecipient);
 
-        emit ERC20StrategyLaunched(
-            terms.token, strategy, msg.sender, name_, symbol_, positionIdOf[strategy], terms.bagSize
-        );
+        emit ERC20StrategyLaunched(terms.token, strategy, msg.sender, name_, symbol_, curve, terms.bagSize);
     }
 
     /**
@@ -456,18 +503,20 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         if (hook == address(0)) revert HookNotSet();
         if (burnRouter == address(0)) revert BurnRouterNotSet();
         if (recursiveImplementation == address(0)) revert RecursiveImplementationNotSet();
+        if (curveImplementation == address(0)) revert CurveImplementationNotSet();
         if (msg.value != launchFee) revert WrongLaunchFee();
 
-        strategy = _deployRecursiveStrategy(name_, symbol_);
-        _open(address(0), strategy, msg.sender);
+        address curve = _deployCurve();
+        strategy = _deployRecursiveStrategy(name_, symbol_, curve);
+        _open(address(0), strategy, curve, msg.sender);
 
-        emit RecursiveStrategyLaunched(strategy, msg.sender, name_, symbol_, positionIdOf[strategy]);
+        emit RecursiveStrategyLaunched(strategy, msg.sender, name_, symbol_, curve);
     }
 
     /// @notice Clones the recursive implementation and wires the new strategy to everything it
     /// will need. The owner is this factory's, never `msg.sender`, for the reason `_deployStrategy`
     /// gives.
-    function _deployRecursiveStrategy(string calldata name_, string calldata symbol_)
+    function _deployRecursiveStrategy(string calldata name_, string calldata symbol_, address curve)
         private
         returns (address strategy)
     {
@@ -478,6 +527,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         config.hook = hook;
         config.poolManager = poolManager;
         config.owner = owner();
+        config.curve = curve;
 
         strategy = LibClone.deployERC1967(recursiveImplementation);
         SweepRecursiveStrategy(payable(strategy)).initialize(config);
@@ -492,20 +542,26 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * `collection => strategy` entry would answer one address for a one-to-many relation — a fact
      * that is wrong the moment a second launch lands. Whatever needs the strategies of a collection
      * reads them from the launch events. A launch with no target passes the zero address and is
-     * recorded as a strategy only. The creator recipient is registered before the
-     * pool is opened, so by the time the first trade can happen the hook already knows where that
-     * trade's creator tenth goes; a zero recipient is simply not registered, and the share falls
-     * through to the protocol. Then the pool, the dust, and the fee.
+     * recorded as a strategy only. The creator recipient is registered before the curve opens,
+     * so by the time the first trade can happen the hook already knows where a trade's creator
+     * tenth will go once the pool exists; a zero recipient is simply not registered, and the
+     * share falls through to the protocol — on the curve as on the pool. The whole supply then
+     * moves onto the curve, which refuses anything less than all of it, and the curve exempts
+     * both the sender and the creator recipient from its snipe tax — two different wallets on a
+     * bag desk or an owner launch. Then the fee.
      */
-    function _open(address target, address strategy, address creatorFeeRecipient) private {
+    function _open(address target, address strategy, address curve, address creatorFeeRecipient) private {
         isStrategy[strategy] = true;
+        curveOf[strategy] = curve;
+        strategyOfCurve[curve] = strategy;
         if (target != address(0)) strategyToCollection[strategy] = target;
         if (creatorFeeRecipient != address(0)) {
             ISweepHookRegistry(hook).registerCreatorFeeRecipient(strategy, creatorFeeRecipient);
         }
 
-        _loadLiquidity(strategy);
-        _burnDust(strategy);
+        uint256 supply = ISweepCurveToken(strategy).balanceOf(address(this));
+        SafeTransferLib.safeTransfer(strategy, curve, supply);
+        ISweepBondingCurve(curve).initialize(strategy, creatorFeeRecipient, msg.sender);
 
         if (launchFee != 0) SafeTransferLib.safeTransferETH(launchFeeRecipient, launchFee);
     }
@@ -516,6 +572,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     function _validateLaunch(address collection, uint256 bidIncreasePerSecond, uint256 maxBid) private view {
         if (hook == address(0)) revert HookNotSet();
         if (burnRouter == address(0)) revert BurnRouterNotSet();
+        if (curveImplementation == address(0)) revert CurveImplementationNotSet();
         if (msg.value != launchFee) revert WrongLaunchFee();
         if (
             bidIncreasePerSecond < MIN_BID_INCREASE_PER_SECOND || bidIncreasePerSecond > MAX_BID_INCREASE_PER_SECOND
@@ -548,6 +605,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         if (hook == address(0)) revert HookNotSet();
         if (burnRouter == address(0)) revert BurnRouterNotSet();
         if (erc20Implementation == address(0)) revert ERC20ImplementationNotSet();
+        if (curveImplementation == address(0)) revert CurveImplementationNotSet();
         if (msg.value != launchFee) revert WrongLaunchFee();
         if (
             terms.bidIncreasePerSecond < MIN_BID_INCREASE_PER_SECOND
@@ -563,10 +621,12 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
 
     /// @notice Clones the fungible implementation and wires the new strategy to everything it will
     /// need. The owner is this factory's, never `msg.sender`, for the reason `_deployStrategy` gives.
-    function _deployERC20Strategy(ERC20Launch memory terms, string calldata name_, string calldata symbol_)
-        private
-        returns (address strategy)
-    {
+    function _deployERC20Strategy(
+        ERC20Launch memory terms,
+        string calldata name_,
+        string calldata symbol_,
+        address curve
+    ) private returns (address strategy) {
         SweepERC20Strategy.Config memory config;
         config.token = terms.token;
         config.bagSize = terms.bagSize;
@@ -580,6 +640,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         config.resaleMultiplierBps = resaleMultiplierBps;
         config.askDecayWindow = 0;
         config.owner = owner();
+        config.curve = curve;
 
         strategy = LibClone.deployERC1967(erc20Implementation);
         SweepERC20Strategy(payable(strategy)).initialize(config);
@@ -595,7 +656,8 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         string calldata name_,
         string calldata symbol_,
         uint256 bidIncreasePerSecond,
-        uint256 maxBid
+        uint256 maxBid,
+        address curve
     ) private returns (address strategy) {
         SweepNFTStrategy.Config memory config;
         config.collection = collection;
@@ -609,6 +671,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         config.resaleMultiplierBps = resaleMultiplierBps;
         config.askDecayWindow = 0;
         config.owner = owner();
+        config.curve = curve;
 
         strategy = LibClone.deployERC1967(strategyImplementation);
         SweepNFTStrategy(payable(strategy)).initialize(config);
@@ -644,14 +707,18 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * `setRouter(old, false)`, made when nothing needs it any more.
      *
      * @dev A burn router that may not swap is a burn router that does nothing, so the two are set
-     * in one call rather than two with a silent failure between them.
+     * in one call rather than two with a silent failure between them. The listing is permanent
+     *: strategies born with this router can never follow it out of the list, so
+     * delisting it would freeze their burns for good.
      */
     function setBurnRouter(address router) external onlyOwner {
         if (router == address(0)) revert InvalidConfiguration();
         burnRouter = router;
         isRouter[router] = true;
+        isPermanentRouter[router] = true;
         emit BurnRouterSet(router);
         emit RouterSet(router, true);
+        emit RouterMadePermanent(router);
     }
 
     /**
@@ -665,11 +732,54 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * took its output as claims would open an escape from the fee: claims move
      * from wallet to wallet without touching the token, fund a hookless pool, and trade there
      * paying nothing forever. Add only a contract whose settlement you have read.
+     *
+     * @dev `RouterPermanent` refuses to delist a frozen router — see `setRouterPermanent` for
+     * why the freeze exists and what it costs.
      */
     function setRouter(address router, bool allowed) external onlyOwner {
         if (router == address(0)) revert InvalidConfiguration();
+        if (!allowed && isPermanentRouter[router]) revert RouterPermanent();
         isRouter[router] = allowed;
         emit RouterSet(router, allowed);
+    }
+
+    /**
+     * @notice Admits a router and freezes it in: it can never be delisted again, by anyone.
+     *
+     * @dev One-way on purpose. The transfer lock makes the listed routers the
+     * only market this token has, so an owner who could empty the list — or an attacker holding
+     * that owner's keys — could freeze every holder's exit in two transactions. The base swap
+     * and burn routers are frozen at deploy; the price is that a permanent router with a bug can
+     * only be routed around by adding a fixed one beside it, never removed, and that is accepted
+     * on the record.
+     */
+    function setRouterPermanent(address router) external onlyOwner {
+        if (router == address(0)) revert InvalidConfiguration();
+        isRouter[router] = true;
+        isPermanentRouter[router] = true;
+        emit RouterSet(router, true);
+        emit RouterMadePermanent(router);
+    }
+
+    /**
+     * @notice Names the implementation every future launch's bonding curve is cloned from.
+     *
+     * @dev `CurveEconomicsMismatch` refuses an implementation whose phantom reserve or
+     * graduation threshold disagrees with the constants this factory splits reserves with at
+     * graduation: a drift between the two would price the pool at something other than the
+     * curve's final spot, silently, on every launch. Existing curves are untouched — a clone
+     * keeps the implementation it was born with.
+     */
+    function setCurveImplementation(address implementation) external onlyOwner {
+        if (implementation == address(0)) revert InvalidConfiguration();
+        if (
+            SweepBondingCurve(payable(implementation)).PHANTOM_QUOTE() != PHANTOM_QUOTE
+                || SweepBondingCurve(payable(implementation)).GRADUATION_THRESHOLD() != GRADUATION_THRESHOLD
+        ) {
+            revert CurveEconomicsMismatch();
+        }
+        curveImplementation = implementation;
+        emit CurveImplementationSet(implementation);
     }
 
     /// @notice Replaces the fungible implementation every future `launchERC20` clones.
@@ -719,28 +829,70 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         emit ResaleMultiplierSet(multiplierBps);
     }
 
+    /// @notice Clones the curve implementation for one launch. Initialisation happens in
+    /// `_open`, after the strategy exists and the supply has moved, because the curve refuses to
+    /// initialise over anything less than the whole supply.
+    function _deployCurve() private returns (address curve) {
+        curve = LibClone.deployERC1967(curveImplementation);
+    }
+
     /**
-     * @notice Opens the pool and abandons the whole supply into one position.
+     * @notice Settles a graduated launch: takes the curve's reserves and opens the strategy's
+     * pool at the curve's exact final price. Permissionless — the keeper drives it, anyone may.
      *
-     * @dev A single `multicall`, so the pool cannot exist without its liquidity. Two actions:
-     * mint the position to the dead address, and settle what it costs. No ETH is forwarded, which
-     * is what makes a launch cost the launcher exactly the fee and not a wei more.
+     * @dev `UnknownStrategy` refuses an address this factory never launched, whose "curve" would
+     * be the zero address and whose "reserves" whatever a hostile contract answers.
+     * `AlreadyPooled` refuses a second graduation, which would try to reopen an existing pool
+     * and revert deep inside v4 rather than here by name; the curve's own `NothingToComplete`
+     * backs it up. The curve refuses `completeGraduation` before its flag, so ungraduated
+     * strategies are refused there by name.
      *
-     * @dev The amount deposited is read from this contract's own balance rather than from a
-     * constant, so it cannot drift from what the strategy actually minted.
-     *
-     * @dev `loadingLiquidity` is raised for exactly the span of this call. It is the only gate the
-     * hook has on pool creation and on deposits, so outside this window nobody can open a Sweep pool
-     * and nobody can add a second position to one that exists.
-     *
-     * @dev No ERC-20 approval to Permit2 appears here and none is missing: solady's ERC20 grants
-     * Permit2 an infinite allowance by default. That is safe on a token with a transfer lock,
-     * because an allowance decides who may ask and the lock decides whether the move happens — a
-     * `permit2.transferFrom` still lands in `_beforeTokenTransfer` and still reverts unless the hook
-     * has authorised it.
+     * @dev The order is the guard. The reserves arrive, the pool's token share is computed with
+     * the same phantom constant the curve priced with — `tokenOut · ethOut / (ethOut + P)`,
+     * which makes the pool's opening price the curve's final spot price — and `assertSeedable`
+     * re-proves the mint before anything irreversible. Everything from `completeGraduation` on
+     * happens in this one transaction: a failed seed reverts the whole thing back onto the
+     * curve, solvent and retryable, which is why no rescue function exists. The
+     * excess is measured as this factory's remaining balance rather than recomputed, so mint
+     * rounding dust burns with it instead of stranding here.
      */
-    function _loadLiquidity(address strategy) private {
-        uint256 supply = SweepNFTStrategy(payable(strategy)).balanceOf(address(this));
+    function createGraduatedPool(address strategy) external nonReentrant returns (uint256 positionId) {
+        address curve = curveOf[strategy];
+        if (curve == address(0)) revert UnknownStrategy();
+        if (positionIdOf[strategy] != 0) revert AlreadyPooled();
+
+        (uint256 ethOut, uint256 tokenOut) = ISweepBondingCurve(curve).completeGraduation();
+        uint256 poolTokens = FixedPointMathLib.fullMulDiv(tokenOut, ethOut, ethOut + PHANTOM_QUOTE);
+        SweepGraduationMath.assertSeedable(TICK_SPACING, ethOut, poolTokens);
+
+        uint160 sqrtPriceX96;
+        (positionId, sqrtPriceX96) = _seedPool(strategy, ethOut, poolTokens);
+
+        uint256 burned = ISweepCurveToken(strategy).balanceOf(address(this));
+        if (burned != 0) SafeTransferLib.safeTransfer(strategy, DEAD_ADDRESS, burned);
+
+        emit StrategyGraduated(strategy, curve, positionId, ethOut, poolTokens, burned, sqrtPriceX96);
+    }
+
+    /**
+     * @notice Opens the pool and mints the graduation position, full-range, to the dead address.
+     *
+     * @dev `loadingLiquidity` is raised for exactly the span of the multicall. It is the only
+     * gate the hook has on pool creation and on deposits, so outside this window nobody can open
+     * a Sweep pool and nobody can add a second position to one that exists — the same gate that
+     * guarded the launch-time load when pools were still created at launch.
+     *
+     * @dev The Permit2 approval is what lets the PositionManager pull the token side; solady's
+     * ERC20 grants Permit2 itself an infinite allowance by default, and that is safe on a locked
+     * token because an allowance decides who may ask while the lock decides whether the move
+     * happens — the pull still lands in `_beforeTokenTransfer` and still needs the transient
+     * allowance the hook opens during this window.
+     */
+    function _seedPool(address strategy, uint256 ethAmount, uint256 tokenAmount)
+        private
+        returns (uint256 positionId, uint160 sqrtPriceX96)
+    {
+        sqrtPriceX96 = SweepGraduationMath.sqrtPriceX96FromAmounts(ethAmount, tokenAmount);
 
         PoolKey memory key = PoolKey({
             currency0: Currency.wrap(address(0)),
@@ -751,59 +903,65 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         });
 
         permit2.approve(strategy, address(positionManager), type(uint160).max, type(uint48).max);
-        positionIdOf[strategy] = positionManager.nextTokenId();
+        positionId = positionManager.nextTokenId();
+        positionIdOf[strategy] = positionId;
 
         loadingLiquidity = true;
-        positionManager.multicall(_launchCalls(key, supply));
+        positionManager.multicall{value: ethAmount}(_graduationCalls(key, sqrtPriceX96, ethAmount, tokenAmount));
         loadingLiquidity = false;
     }
 
     /**
      * @notice The two calls that open the pool and fill it, encoded for the PositionManager.
      *
-     * @dev Split out of `_loadLiquidity` to keep both inside the reachable stack without `via_ir`,
+     * @dev Split out of `_seedPool` to keep both inside the reachable stack without `via_ir`,
      * which `forge coverage` cannot use. The split is a compiler constraint, not a boundary.
      *
-     * @dev A position whose range opens at its own top holds only the upper currency, so it needs
-     * no ETH. That is stated twice on purpose: the factory forwards no value, and `amount0Max` is
-     * zero. The first is what actually enforces it — the PositionManager cannot spend ETH it was
-     * never given — and the second is there so a future change that reintroduces a `value:` does
-     * not silently start spending the launcher's fee. Only the first is observable, so only the
-     * first is under test.
-     *
-     * @dev Sending no ETH at all, rather than a few wei that would be stranded in the
-     * PositionManager or have to be swept back, is also what makes a free launch — `launchFee` of
-     * zero — work at all: a factory holding no ETH has none to forward.
-     *
-     * @dev The liquidity is computed from the range rather than pasted as a constant. A constant
-     * beside a range can drift from it silently, and a wrong one here would deposit the wrong share
-     * of the supply.
+     * @dev Unlike the launch-time load this replaces, the position is two-sided: all the swept
+     * ETH against the pool's token allocation, so the mint carries value and the action list
+     * ends with a `SWEEP` of the native side — liquidity rounds down, and without the sweep the
+     * unabsorbed wei would strand in the PositionManager. They go to the dead address, which
+     * accepts ETH unconditionally: sent to the launch fee recipient instead, a recipient that
+     * refuses ETH would turn one wei of dust into a revert of every graduation. Wei-scale, and
+     * disclosed. The token side's rounding remainder stays in the factory and is burnt by the
+     * caller.
      */
-    function _launchCalls(PoolKey memory key, uint256 supply) private view returns (bytes[] memory params) {
-        int24 tickLower = TickMath.minUsableTick(TICK_SPACING);
-        uint160 startingPrice = TickMath.getSqrtPriceAtTick(TICK_UPPER);
-        uint128 liquidity =
-            LiquidityAmounts.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tickLower), startingPrice, supply);
+    function _graduationCalls(PoolKey memory key, uint160 sqrtPriceX96, uint256 ethAmount, uint256 tokenAmount)
+        private
+        view
+        returns (bytes[] memory params)
+    {
+        (int24 tickLower, int24 tickUpper) = SweepGraduationMath.fullRangeTicks(TICK_SPACING);
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            ethAmount,
+            tokenAmount
+        );
 
-        bytes[] memory mintParams = new bytes[](2);
-        mintParams[0] = abi.encode(key, tickLower, TICK_UPPER, liquidity, 0, supply, DEAD_ADDRESS, bytes(""));
+        bytes[] memory mintParams = new bytes[](3);
+        mintParams[0] = abi.encode(
+            key, tickLower, tickUpper, liquidity, uint128(ethAmount), uint128(tokenAmount), DEAD_ADDRESS, bytes("")
+        );
         mintParams[1] = abi.encode(key.currency0, key.currency1);
+        mintParams[2] = abi.encode(key.currency0, DEAD_ADDRESS);
 
-        bytes memory actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
+        bytes memory actions =
+            abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR), uint8(Actions.SWEEP));
 
         params = new bytes[](2);
-        params[0] = abi.encodeCall(IPoolInitializer_v4.initializePool, (key, startingPrice));
+        params[0] = abi.encodeCall(IPoolInitializer_v4.initializePool, (key, sqrtPriceX96));
         params[1] =
             abi.encodeCall(IPositionManager.modifyLiquidities, (abi.encode(actions, mintParams), block.timestamp));
     }
 
-    /// @notice Sends whatever the position could not absorb to the dead address.
-    /// @dev Liquidity rounds down, so a few wei of token never enter the position. Left alone they
-    /// would stay in the factory forever, and because of the transfer lock they could not even be
-    /// moved out. The dead address is the one destination the lock always permits.
-    function _burnDust(address strategy) private {
-        uint256 dust = SweepNFTStrategy(payable(strategy)).balanceOf(address(this));
-        if (dust != 0) SweepNFTStrategy(payable(strategy)).transfer(DEAD_ADDRESS, dust);
+    /// @notice Accepts a graduating curve's reserves, and nothing else.
+    /// @dev The reserves arrive as a plain transfer inside `completeGraduation`; refusing every
+    /// other sender keeps "the factory holds no ETH between transactions" true, which is what
+    /// makes a zero launch fee workable and what keeps a mistaken send from stranding here.
+    receive() external payable {
+        if (strategyOfCurve[msg.sender] == address(0)) revert DirectPaymentRejected();
     }
 
     /// @notice Who may retune this factory and who owns every strategy it launches.

@@ -2,6 +2,10 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {LibClone} from "solady/src/utils/LibClone.sol";
+import {MockStrategyHook} from "./mocks/MockStrategyHook.sol";
+import {OperatorCollection, OperatorThiefMarketplace} from "./mocks/OperatorAttack.sol";
+import {MockSweepFactory} from "./mocks/MockSweepFactory.sol";
 
 import {SweepStrategy} from "../src/SweepStrategy.sol";
 import {SweepToken} from "../src/SweepToken.sol";
@@ -28,7 +32,9 @@ contract NFTStrategyTest is Test {
     HostileMarketplace internal venue;
     MockBurnRouter internal router;
 
-    address internal hook = makeAddr("hook");
+    MockSweepFactory internal mockFactory = new MockSweepFactory(address(this));
+    address internal hook = address(new MockStrategyHook(address(mockFactory), makeAddr("protocol")));
+    address internal curveAddr = makeAddr("curve");
     address internal poolManager = makeAddr("poolManager");
     address internal owner = makeAddr("owner");
     address internal seller = makeAddr("seller");
@@ -46,7 +52,7 @@ contract NFTStrategyTest is Test {
         venue = new HostileMarketplace();
         router = new MockBurnRouter();
 
-        strategy = new SweepNFTStrategy();
+        strategy = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
         strategy.initialize(
             _config(
                 address(collection),
@@ -132,7 +138,7 @@ contract NFTStrategyTest is Test {
      * money invariant — balance equals treasury plus the burn queue — survives the purchase.
      */
     function test_FeesCreditedDuringTheFillAreNotBookedAsChange() public {
-        SweepNFTStrategy s = new SweepNFTStrategy();
+        SweepNFTStrategy s = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
         s.initialize(
             _config(
                 address(collection),
@@ -414,6 +420,76 @@ contract NFTStrategyTest is Test {
         tokenId = _listAndFill(price);
     }
 
+    /* the inventory walk */
+
+    /**
+     * @notice A venue that delivers two junk pieces and lifts a held one through the
+     * collection's pre-approved operator passes every delivery check — balance net plus one,
+     * expected piece owned — and is caught only by the walk over the previous inventory. A
+     * proof-of-concept of this attack lands in exactly this shape.
+     */
+    function test_VenueThatLiftsInventoryThroughAnOperatorRevertsThePurchase() public {
+        OperatorCollection oc = new OperatorCollection();
+        SweepNFTStrategy s = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
+        s.initialize(
+            _config(
+                address(oc),
+                address(router),
+                "Op",
+                "OP",
+                hook,
+                poolManager,
+                BID_PER_SECOND,
+                MAX_BID,
+                MULTIPLIER,
+                0,
+                owner
+            )
+        );
+        OperatorThiefMarketplace thief = new OperatorThiefMarketplace(oc, makeAddr("fence"));
+        oc.setGlobalOperator(address(thief));
+
+        vm.prank(hook);
+        s.addFees{value: 10 ether}();
+        vm.warp(block.timestamp + 200);
+        uint256 heldId = oc.mint(address(thief));
+        s.buyTargetNFT(1 ether, abi.encodeCall(thief.fulfill, (heldId)), heldId, address(thief));
+        assertEq(s.inventoryCount(), 1);
+
+        vm.warp(block.timestamp + 200);
+        uint256 deliverId = oc.mint(address(thief));
+        uint256 extraId = oc.mint(address(thief));
+        vm.expectRevert(SweepDesk.InventoryBreached.selector);
+        s.buyTargetNFT(
+            1 ether, abi.encodeCall(thief.fulfillAndSteal, (deliverId, extraId, heldId)), deliverId, address(thief)
+        );
+
+        assertEq(oc.ownerOf(heldId), address(s), "the lifted piece did not come back with the revert");
+        assertEq(s.inventoryCount(), 1);
+    }
+
+    /// @notice The shelf is enumerable — which is both what the walk above iterates and what
+    /// finally makes the inventory visible — and a sale removes exactly the sold id.
+    function test_TheShelfIsEnumerable() public {
+        uint256 first = _fundAndBuy(1 ether);
+        vm.warp(block.timestamp + 200);
+        uint256 second = _listAndFill(1 ether);
+
+        uint256[] memory held = strategy.heldTokenIds();
+        assertEq(held.length, 2);
+        assertEq(held[0], first);
+        assertEq(held[1], second);
+
+        vm.deal(buyer, 3 ether);
+        vm.prank(buyer);
+        strategy.sellTargetNFT{value: strategy.askPrice(first)}(first);
+
+        held = strategy.heldTokenIds();
+        assertEq(held.length, 1);
+        assertEq(held[0], second);
+        assertEq(strategy.inventoryCount(), 1);
+    }
+
     /* ────────────────────── delivery and config ────────────────────── */
 
     /**
@@ -425,7 +501,7 @@ contract NFTStrategyTest is Test {
      */
     function test_SaleDetectsACollectionThatDoesNotDeliver() public {
         LyingCollection liar = new LyingCollection();
-        SweepNFTStrategy s = new SweepNFTStrategy();
+        SweepNFTStrategy s = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
         s.initialize(
             _config(
                 address(liar),
@@ -467,7 +543,7 @@ contract NFTStrategyTest is Test {
 
     /// @notice A strategy with no collection could never buy anything.
     function test_InitRefusesAZeroCollection() public {
-        SweepNFTStrategy fresh = new SweepNFTStrategy();
+        SweepNFTStrategy fresh = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(
             _config(
@@ -488,7 +564,7 @@ contract NFTStrategyTest is Test {
 
     /// @notice A strategy with no router could never burn what it earns.
     function test_InitRefusesAZeroBurnRouter() public {
-        SweepNFTStrategy fresh = new SweepNFTStrategy();
+        SweepNFTStrategy fresh = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(
             _config(
@@ -509,7 +585,7 @@ contract NFTStrategyTest is Test {
 
     /// @notice A markup below par would realise a loss on every completed cycle.
     function test_InitRefusesAMarkupBelowPar() public {
-        SweepNFTStrategy fresh = new SweepNFTStrategy();
+        SweepNFTStrategy fresh = SweepNFTStrategy(payable(LibClone.clone(address(new SweepNFTStrategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(
             _config(
@@ -528,20 +604,28 @@ contract NFTStrategyTest is Test {
         );
     }
 
-    /// @notice The router can be repointed, because the factory supplies the real one and routers get
-    /// redeployed.
-    function test_OwnerCanRepointTheBurnRouter() public {
+    /// @notice The router can be repointed to one the factory lists, because routers get
+    /// redeployed — and only to one the factory lists, because pointing the burn anywhere else
+    /// is a drain on every queued sale.
+    function test_OwnerCanRepointTheBurnRouterToAListedOne() public {
         MockBurnRouter replacement = new MockBurnRouter();
+        mockFactory.setRouter(address(replacement), true);
         vm.prank(owner);
         strategy.setBurnRouter(address(replacement));
         assertEq(strategy.burnRouter(), address(replacement));
     }
 
-    /// @notice Repointing at nothing would leave every burn reverting.
-    function test_BurnRouterRefusesZero() public {
-        vm.prank(owner);
-        vm.expectRevert(SweepToken.InvalidConfiguration.selector);
+    /// @notice An unlisted router is refused by name; the zero address is never listed, so the
+    /// old zero-check is a special case of the same refusal.
+    function test_SetBurnRouterRefusesAnUnlistedRouter() public {
+        MockBurnRouter rogue = new MockBurnRouter();
+        vm.startPrank(owner);
+        vm.expectRevert(SweepDesk.RouterNotListed.selector);
+        strategy.setBurnRouter(address(rogue));
+
+        vm.expectRevert(SweepDesk.RouterNotListed.selector);
         strategy.setBurnRouter(address(0));
+        vm.stopPrank();
     }
 
     /// @notice Only the owner may repoint it.
@@ -574,7 +658,7 @@ contract NFTStrategyTest is Test {
         uint256 resaleMultiplierBps_,
         uint256 askDecayWindow_,
         address owner_
-    ) internal pure returns (SweepNFTStrategy.Config memory config) {
+    ) internal view returns (SweepNFTStrategy.Config memory config) {
         config.collection = collection_;
         config.burnRouter = burnRouter_;
         config.name = name_;
@@ -586,5 +670,6 @@ contract NFTStrategyTest is Test {
         config.resaleMultiplierBps = resaleMultiplierBps_;
         config.askDecayWindow = askDecayWindow_;
         config.owner = owner_;
+        config.curve = curveAddr;
     }
 }

@@ -131,25 +131,26 @@ contract FactoryRecursiveTest is SweepForkTest {
     /// @notice The event is its own, so an indexer tells the kind apart by signature.
     function test_LaunchEmitsItsOwnEvent() public {
         vm.expectEmit(false, true, false, false, address(factory));
-        emit SweepNFTStrategyFactory.RecursiveStrategyLaunched(address(0), trader, "Sweep Recursive", "sREC", 0);
+        emit SweepNFTStrategyFactory.RecursiveStrategyLaunched(
+            address(0), trader, "Sweep Recursive", "sREC", address(0)
+        );
         _launchRecursive();
     }
 
     /* ─────────────────────────── the pool ───────────────────────────── */
 
-    /// @notice Same pool, same price, same abandoned position as every other launch; and the whole
-    /// supply sits with the PoolManager and the dead address, so nobody is eligible yet.
+    /// @notice Same curve, same graduation, same abandoned position as every other launch — and
+    /// the curve's buyers are already eligible holders when the pool opens, because a recursive
+    /// strategy's whole point is that plain holding earns, curve-bought or pool-bought.
     function test_ThePoolOpensLikeEveryOtherLaunch() public {
         address strategy = _launchRecursive();
-        PoolKey memory key = _keyFor(strategy);
         SweepRecursiveStrategy s = SweepRecursiveStrategy(payable(strategy));
 
-        (uint160 sqrtPriceX96, int24 tick,,) = manager.getSlot0(key.toId());
-        assertEq(sqrtPriceX96, TickMath.getSqrtPriceAtTick(factory.TICK_UPPER()));
-        assertEq(tick, factory.TICK_UPPER());
+        (uint160 sqrtPriceX96,,,) = manager.getSlot0(_keyFor(strategy).toId());
+        assertGt(sqrtPriceX96, 0, "no pool exists after graduation");
         IERC721 posm = IERC721(address(factory.positionManager()));
         assertEq(posm.ownerOf(factory.positionIdOf(strategy)), DEAD_ADDRESS);
-        assertEq(s.eligibleSupply(), 0, "somebody is eligible before anyone bought");
+        assertEq(s.eligibleSupply(), s.balanceOf(whale), "curve buyers are the eligible holders");
         assertEq(s.balanceOf(address(factory)), 0, "tokens stayed in the factory");
     }
 
@@ -205,7 +206,11 @@ contract FactoryRecursiveTest is SweepForkTest {
         _buyAs(key, other, 1 ether);
         uint256 pending = strategy.pendingRewards();
         assertGt(pending, 0, "the trades funded nothing");
-        assertEq(strategy.eligibleSupply(), strategy.balanceOf(trader) + strategy.balanceOf(other));
+        assertEq(
+            strategy.eligibleSupply(),
+            strategy.balanceOf(trader) + strategy.balanceOf(other) + strategy.balanceOf(whale),
+            "eligibility is exactly the holders: the two pool buyers and the curve's whale"
+        );
 
         strategy.distribute();
 
@@ -220,9 +225,10 @@ contract FactoryRecursiveTest is SweepForkTest {
             owedTrader * strategy.balanceOf(other), owedOther * strategy.balanceOf(trader), 1e9, "not pro rata"
         );
 
-        address[] memory holders = new address[](2);
+        address[] memory holders = new address[](3);
         holders[0] = trader;
         holders[1] = other;
+        holders[2] = whale;
         uint256 traderBefore = strategy.balanceOf(trader);
         uint256 otherBefore = strategy.balanceOf(other);
         strategy.claimFor(holders);
@@ -231,7 +237,7 @@ contract FactoryRecursiveTest is SweepForkTest {
         assertEq(strategy.balanceOf(other), otherBefore + owedOther);
         assertEq(strategy.claimable(trader), 0);
         assertEq(strategy.claimable(other), 0);
-        assertLe(strategy.reserved(), 2, "the desk holds more than the floor's residue");
+        assertLe(strategy.reserved(), 3, "the desk holds more than the floor's residue");
         assertEq(strategy.balanceOf(strategyAddr), strategy.reserved() + strategy.carry());
         assertEq(address(strategy).balance, strategy.pendingRewards(), "ETH conservation");
     }
@@ -241,6 +247,7 @@ contract FactoryRecursiveTest is SweepForkTest {
     function _launchRecursive() private returns (address strategy) {
         vm.prank(trader);
         strategy = factory.launchRecursive{value: LAUNCH_FEE}("Sweep Recursive", "sREC");
+        _graduate(strategy);
     }
 
     function _buyAs(PoolKey memory key, address who, uint256 ethIn) private {

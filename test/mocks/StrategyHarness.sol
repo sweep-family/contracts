@@ -21,15 +21,20 @@ contract StrategyHarness is SweepStrategy {
     /// @notice Number of times `_executeBurn` was reached.
     uint256 public burnCalls;
 
+    /// @dev Raised only for the span of `exposed_credit`, the one movement the lock skips.
+    bool private crediting;
+
     function initialize(
         string memory name_,
         string memory symbol_,
         address hook_,
         address poolManager_,
+        address curve_,
         uint256 bidIncreasePerSecond_,
         uint256 maxBid_,
         address owner_
     ) external initializer {
+        __SweepCurve_init(curve_);
         __SweepStrategy_init(name_, symbol_, hook_, poolManager_, bidIncreasePerSecond_, maxBid_, owner_);
         isDistributor[msg.sender] = true;
     }
@@ -57,9 +62,20 @@ contract StrategyHarness is SweepStrategy {
         _transfer(msg.sender, DEAD_ADDRESS, amount);
     }
 
-    /// @notice Hands tokens to a test account, bypassing the lock the way the router does.
+    /// @notice Hands tokens to a test account as setup, outside the lock.
+    /// @dev A fixture seam, not a transfer under test: the PoolManager stand-in needs a balance
+    /// before a test can exercise the allowance, and since a distributor's send into
+    /// the PoolManager is a pool leg like any other, so the deployer can no longer seed it with a
+    /// plain transfer.
     function exposed_credit(address to, uint256 amount) external {
+        crediting = true;
         _transfer(msg.sender, to, amount);
+        crediting = false;
+    }
+
+    /// @dev Defers to the real lock except inside `exposed_credit`.
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal override {
+        if (!crediting) super._beforeTokenTransfer(from, to, amount);
     }
 
     /// @dev Records what a real strategy would have swapped.

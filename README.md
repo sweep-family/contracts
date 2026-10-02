@@ -37,11 +37,17 @@
 ## What this is
 
 Sweep is a launchpad for strategy tokens on [Robinhood Chain](https://chain.robinhood.com), an
-Arbitrum Orbit L2 with ~101 ms blocks. A launch mints one billion tokens into a single-sided
-Uniswap v4 position and sends the position NFT to the dead address, so the liquidity can never be
-withdrawn by anyone. Every trade on the pool pays a ten percent fee to a hook. Eighty percent of
-that fee funds a treasury that buys what the strategy targets, relists it at a markup at the
-strategy's own desk, and burns the proceeds back into the token.
+Arbitrum Orbit L2 with ~101 ms blocks. A launch moves its whole supply of one billion tokens onto
+its own bonding curve, which sells it against a virtual 1.68 ETH reserve until the curve holds
+4.2 ETH of real ETH. The buy that crosses that line graduates the launch: a Uniswap v4 pool opens
+at the curve's exact final price, seeded with every wei the curve took in, and the position NFT
+goes to the dead address, so the liquidity can never be withdrawn by anyone. From then on every
+trade on the pool pays a ten percent fee to a hook. Eighty percent of that fee funds a treasury
+that buys what the strategy targets, relists it at a markup at the strategy's own desk, and burns
+the proceeds back into the token.
+
+Most launches never find 4.2 ETH of demand. Those never open a pool and never run a desk: the
+curve is the filter.
 
 **The token is not backed by what the treasury holds.** There is no redemption, no NAV, no claim.
 The inventory is a machine. Value reaches holders as buy pressure and burnt supply, never as a
@@ -62,17 +68,32 @@ The recursive strategy keeps no treasury and no desk. Its fees queue as ETH; `di
 the token back through the burn router, and `claimFor()` hands what was bought to every holder in
 proportion to their balance, as plain transfers. The split is a reward accumulator settled inside
 the token's transfer hook, so a balance only earns from distributions it was held through. The
-pool, the dead address, the hook, the router and the strategy itself are excluded, fixed at
-launch, with no setter.
+pool, the dead address, the hook, the router, the curve, the factory and the strategy itself are
+excluded, fixed at launch, with no setter. Curve buyers are holders from their first buy.
 
 ## The machine
 
 ```
+   ┌────────────── SweepBondingCurve (one clone per launch) ─────────┐
+   │  the whole supply, sold against a virtual 1.68 ETH reserve       │
+   │  1% to the protocol + 2% to the creator on every trade           │
+   │  99% snipe tax in the first second, gone after five              │
+   │  the token stays transfer-locked: the curve is the only market   │
+   └──────────────────────────────────────────────────────────────────┘
+                                 │ the curve holds 4.2 ETH: graduation
+                                 ▼  createGraduatedPool (anyone)
+   ┌────────────── the pool opens at the curve's final price ────────┐
+   │  all the curve's ETH against the reserved 2/7 of the supply      │
+   │  the part the price does not need (4/49) is burnt                │
+   │  full-range position, owned by 0x…dEaD                           │
+   └──────────────────────────────────────────────────────────────────┘
+                                 │
                           trade on the pool
                                  │
                                  ▼
    ┌────────────── SweepHook (Uniswap v4 afterSwap) ─────────────────┐
-   │  10% of every swap, in both directions, from the first block     │
+   │  10% of every swap, in both directions, from the pool's first    │
+   │  block                                                           │
    │  refuses any swap not sent through a router the factory lists    │
    │  80% ──► strategy treasury            (push, addFees)            │
    │  10% ──► collection / token owner     (pull, claimFeesFor)       │
@@ -94,7 +115,11 @@ launch, with no setter.
    └──────────────────────────────────────────────────────────────────┘
 ```
 
-Four design choices worth knowing before reading the code:
+Five design choices worth knowing before reading the code:
+
+- **No rescue path.** The curve has no owner, no setter and no upgrade. Its reserves move to the
+  pool in the same transaction that opens it, so they are only ever on the curve or in the pool;
+  a seed that fails reverts the whole graduation back onto the curve, where anyone can retry it.
 
 - **Time, not blocks.** The bid ramp is paced by `block.timestamp`. Robinhood Chain produces a
   block every ~101 ms, so anything paced by `block.number` runs about 119× faster here than on
@@ -113,17 +138,19 @@ Four design choices worth knowing before reading the code:
 
 ```
 src/
+  SweepBondingCurve.sol        the launch market: buy / sell / graduate, one clone per launch
   SweepToken.sol               the token: supply, transfer lock, hook wiring            (abstract)
   SweepStrategy.sol            the treasury, the bid, the burn queue                   (abstract)
   SweepDesk.sol                resale terms, the ask, the burn router                  (abstract)
   SweepNFTStrategy.sol         pieces: buyTargetNFT / sellTargetNFT
   SweepERC20Strategy.sol       bags:   buyTokens / sellTokens
   SweepRecursiveStrategy.sol   airdrops: distribute / claimFor / claim
-  SweepNFTStrategyFactory.sol  launch, launchERC20, launchRecursive; the pool and the position
+  SweepNFTStrategyFactory.sol  launch, launchERC20, launchRecursive; createGraduatedPool
   SweepHook.sol                the fee, its split, the router gate, the Trade event
   SweepBurnRouter.sol          proceeds → the strategy's own token → the dead address
   SweepSwapRouter.sol          buy / sell / quote for a front end, with the trader in hookData
-  interfaces/                  ISweepFactory, ISweepFeeReceiver, ISweepLockedToken,
+  libraries/                   SweepCurveMath (the curve's pricing), SweepGraduationMath (the seed)
+  interfaces/                  ISweepFactory, ISweepFeeReceiver, ISweepLockedToken, ISweepBondingCurve,
                                ISweepHookRegistry, ISweepBurnRouter, IOwnable
   testing/                     SweepTestCollection, SweepTestToken: testnet fixtures, never for mainnet
 script/
@@ -149,8 +176,9 @@ SweepToken                    ERC-20, Ownable, Initializable, ReentrancyGuard
   └── SweepRecursiveStrategy  reward accumulator, fee receiver
 ```
 
-Strategies are minimal-proxy clones of implementation contracts the factory owner publishes. The
-factory, the hook and the routers are plain contracts with no proxy and no upgrade path. Nothing
+Strategies and curves are clones of implementation contracts the factory owner publishes; an
+implementation itself can never be initialised. The factory, the hook and the routers are plain
+contracts with no proxy and no upgrade path. Nothing
 in the protocol is upgradeable: a change ships as a new stack.
 
 ### Solidity conventions
@@ -167,19 +195,24 @@ in the protocol is upgradeable: a change ships as a new stack.
 
 | Constant | Value | Where |
 | --- | --- | --- |
-| Supply | 1,000,000,000 tokens, all in the launch position | `SweepToken.MAX_SUPPLY` |
-| Opening price | tick 175,020 → ~39.87M tokens per ETH → ~25.08 ETH FDV | `SweepNFTStrategyFactory.TICK_UPPER` |
-| Pool | ETH / token, LP fee 0, tick spacing 60, hooked | `SweepNFTStrategyFactory` |
-| Swap fee | 10% in both directions, flat from the first block | `SweepHook.FEE_BPS` |
+| Supply | 1,000,000,000 tokens, all on the launch's curve | `SweepToken.MAX_SUPPLY` |
+| Opening price | 1.68 ETH FDV: the virtual reserve over the supply | `SweepBondingCurve.PHANTOM_QUOTE` |
+| Graduation | at 4.2 ETH of real ETH on the curve; 5/7 of the supply sellable before it | `SweepBondingCurve.GRADUATION_THRESHOLD` |
+| Graduation price | 12.25× the opening price, 20.58 ETH FDV; the pool opens at exactly this price | `SweepNFTStrategyFactory` |
+| Burnt at graduation | 4/49 of the supply (~8.16%), the reserved allocation the pool does not need | `createGraduatedPool` |
+| Curve fees | 1% to the protocol + 2% to the creator, on every curve trade's ETH leg | `SweepBondingCurve` |
+| Snipe tax | 99% at second zero, ~25% at one, ~3% at two, zero from second five; launcher and creator exempt | `SweepBondingCurve` |
+| Pool | ETH / token, LP fee 0, tick spacing 60, hooked, full range | `SweepNFTStrategyFactory` |
+| Swap fee | 10% in both directions, flat from the pool's first block | `SweepHook.FEE_BPS` |
 | Fee split | 80 treasury / 10 owner / 10 protocol | `SweepHook` |
 | Bid pace | 10¹² to 10¹⁶ wei per second, cap ≤ 100 ETH, chosen at launch | `SweepNFTStrategyFactory` bounds |
 | Resale markup | ×1.20, set on the factory and retunable per strategy by the owner | `resaleMultiplierBps` |
 | Ask decay | off (window 0): a fixed ask; the decay is a lever kept switched off | `SweepDesk.askDecayWindow` |
-| Burn pacing | ≤ 1 ETH per pass, 12 s cooldown, 0.5% to the caller | `SweepStrategy` |
+| Burn pacing | 0.1 ETH per pass by default, never above 0.25 ETH, 12 s cooldown, 0.5% to the caller | `SweepStrategy.MAX_BURN_INCREMENT` |
 | Bag | `totalSupply / 1000`, sized by the factory, never by a front end | `SweepNFTStrategyFactory.BAG_DIVISOR` |
 | Launch fee | 0.001 ETH by default, exact in both directions | `SweepNFTStrategyFactory.launchFee` |
 | Airdrop floor | 0.001 ETH pending before a distribution runs; shares under 10¹² wei are left in the pot | `SweepRecursiveStrategy` |
-| Hook permissions | `0x2444`: after-initialize, after-add-liquidity, after-swap, after-swap-returns-delta | `SweepHook.getHookPermissions` |
+| Hook permissions | `0x2444`: before-initialize, after-add-liquidity, after-swap, after-swap-returns-delta | `SweepHook.getHookPermissions` |
 
 The hook's address encodes its permissions in its low bits and is mined with CREATE2 over an
 initcode that contains the factory's address, so a new factory always means a new hook.
@@ -188,15 +221,22 @@ initcode that contains the factory's address, so a new factory always means a ne
 
 What nobody can do, including the protocol:
 
-- withdraw the launch liquidity (the position NFT is owned by the dead address);
+- withdraw the pool's liquidity (the position NFT is owned by the dead address);
+- touch a curve's ETH: the curve has no owner, no setter and no rescue, and its entry in the
+  token's transfer lock cannot be changed, so it cannot be frozen either;
 - change a launched pool's hook, mint supply, or take pieces out of a desk;
-- bypass the fee through a second, unhooked pool: transfers of the token are locked to the pool,
-  and the hook refuses swaps that do not come through a listed router.
+- bypass the fee through a second, unhooked pool: transfers of the token are locked to the curve
+  and the pool, every movement through the PoolManager needs the hook's allowance — distributors
+  included — and the hook refuses swaps that do not come through a listed router;
+- delist the base swap and burn routers, which are permanent.
 
-What the factory owner can do, immediately and with no timelock, on every strategy it owns:
+What the factory owner can do, immediately and with no timelock, on every strategy it owns, within
+the bounds each setter enforces:
 
-- set a desk's bid pace and cap, its resale terms, its burn pacing and its burn router;
-- list or delist a router, and name fee-free distributors;
+- set a desk's bid pace and cap (within the launch bounds; a raise at most doubles, once per seven
+  days), its resale terms, its burn pacing (at most 0.25 ETH a pass) and its burn router (only a
+  router the factory lists);
+- list a new router, and name distributors that may send wallet to wallet;
 - launch on behalf of a target, change the launch fee and its recipient, and change which
   implementation future launches clone.
 
@@ -248,10 +288,11 @@ PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951`. The rest is in
 
 See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
-- 275 tests across 18 suites: unit suites against mocks, fuzz suites on every piece of arithmetic,
-  an invariant suite on the money ledgers, and fork suites that run every launch, trade, purchase,
-  resale, burn and airdrop against the real Uniswap v4 bytecode on Robinhood Chain. CI runs all
-  of them on every push.
+- 351 tests across 22 suites: unit suites against mocks, fuzz suites on every piece of arithmetic
+  (the curve's pricing round trip included), invariant suites on the money ledgers and on the
+  curve's books, and fork suites that run every launch, curve trade, graduation, pool trade,
+  purchase, resale, burn and airdrop against the real Uniswap v4 bytecode on Robinhood Chain. CI
+  runs all of them on every push.
 - The one arbitrary external call in the protocol, `SweepNFTStrategy.buyTargetNFT`, is bounded by
   the bid and by the treasury, refused when the venue is the collection itself, costed as a balance
   delta net of any fee credited during the call, refused at zero cost, and followed by an assertion

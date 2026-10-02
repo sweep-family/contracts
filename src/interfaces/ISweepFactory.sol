@@ -46,3 +46,13 @@ interface ISweepFactory {
     /// not a permission a trader holds: anyone may trade, through one of them.
     function isRouter(address router) external view returns (bool);
 }
+
+/**
+ * @title ISweepHooked
+ * @author 0xDAVZER
+ * @notice The one thing a strategy asks of its hook: which factory it answers to, so the
+ * strategy's own owner-facing setters can be gated on facts the owner cannot repoint.
+ */
+interface ISweepHooked {
+    function factory() external view returns (address);
+}

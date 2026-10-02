@@ -20,6 +20,7 @@ import {HookMiner} from "@uniswap/v4-hooks-public/src/utils/HookMiner.sol";
 import {Ownable} from "solady/src/auth/Ownable.sol";
 
 import {SweepNFTStrategyFactory} from "../../src/SweepNFTStrategyFactory.sol";
+import {SweepBondingCurve} from "../../src/SweepBondingCurve.sol";
 import {SweepNFTStrategy} from "../../src/SweepNFTStrategy.sol";
 import {SweepHook} from "../../src/SweepHook.sol";
 import {ISweepFactory} from "../../src/interfaces/ISweepFactory.sol";
@@ -64,6 +65,7 @@ abstract contract SweepForkTest is Test {
 
     SweepNFTStrategyFactory internal factory;
     SweepHook internal hook;
+    SweepBondingCurve internal curveImplementation;
     SweepTestCollection internal collection;
     SweepBurnRouter internal burnRouter;
     SweepSwapRouter internal sweepRouter;
@@ -72,6 +74,7 @@ abstract contract SweepForkTest is Test {
     address internal feeTo = makeAddr("feeTo");
     address internal launcher = makeAddr("launcher");
     address internal trader = makeAddr("trader");
+    address internal whale = makeAddr("whale");
 
     uint256 internal constant LAUNCH_FEE = 0.001 ether;
     uint256 internal constant BID_PER_SECOND = 0.001 ether;
@@ -108,10 +111,14 @@ abstract contract SweepForkTest is Test {
         factory.setBurnRouter(address(burnRouter));
 
         sweepRouter = new SweepSwapRouter(manager, ISweepFactory(address(factory)));
-        factory.setRouter(address(sweepRouter), true);
+        factory.setRouterPermanent(address(sweepRouter));
+
+        curveImplementation = new SweepBondingCurve();
+        factory.setCurveImplementation(address(curveImplementation));
 
         vm.deal(launcher, 10 ether);
         vm.deal(trader, 100 ether);
+        vm.deal(whale, 100 ether);
     }
 
     /* ------------------------------------------------------------------ */
@@ -148,18 +155,33 @@ abstract contract SweepForkTest is Test {
         });
     }
 
-    /// @dev One launch by the collection's owner, and the pool key it produced.
+    /// @dev One launch by the collection's owner, graduated to its pool, and the pool key it
+    /// produced. Most tests want the machine running, and the machine starts
+    /// at graduation, so the whole curve life happens inside this helper; a test about the curve
+    /// phase itself uses `_launchOnCurve`.
     function _launch() internal returns (address strategy, PoolKey memory key) {
+        (strategy,) = _launchOnCurve();
+        _graduate(strategy);
+        key = _poolKeyFor(strategy);
+    }
+
+    /// @dev One launch by the collection's owner, still on its curve: no pool exists yet.
+    function _launchOnCurve() internal returns (address strategy, SweepBondingCurve curve) {
         vm.prank(launcher);
         strategy =
             factory.launch{value: LAUNCH_FEE}(address(collection), "Sweep Test Apes", "sSTA", BID_PER_SECOND, MAX_BID);
-        key = PoolKey({
-            currency0: Currency.wrap(address(0)),
-            currency1: Currency.wrap(strategy),
-            fee: factory.LP_FEE(),
-            tickSpacing: factory.TICK_SPACING(),
-            hooks: IHooks(address(hook))
-        });
+        curve = SweepBondingCurve(payable(factory.curveOf(strategy)));
+    }
+
+    /// @dev Fills a strategy's curve with one crossing buy and settles the graduation, the way a
+    /// launch's life actually goes. The warp steps past the snipe window — five seconds — so
+    /// the whale pays the flat curve fees rather than the launch-second tax.
+    function _graduate(address strategy) internal {
+        SweepBondingCurve curve = SweepBondingCurve(payable(factory.curveOf(strategy)));
+        vm.warp(block.timestamp + 5);
+        vm.prank(whale);
+        curve.buy{value: 20 ether}(0, whale);
+        factory.createGraduatedPool(strategy);
     }
 
     /// @dev v4 wraps whatever a hook reverts with, so expecting the bare selector would pass on any

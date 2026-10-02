@@ -12,6 +12,7 @@ pragma solidity ^0.8.26;
     sweeping the floor, one cycle at a time
 */
 
+import {ISweepFactory, ISweepHooked} from "./interfaces/ISweepFactory.sol";
 import {SweepStrategy} from "./SweepStrategy.sol";
 import {ISweepBurnRouter} from "./interfaces/ISweepBurnRouter.sol";
 
@@ -57,6 +58,9 @@ abstract contract SweepDesk is SweepStrategy {
     error WrongPayment();
 
     event ResaleTermsUpdated(uint256 multiplierBps, uint256 decayWindow);
+    error RouterNotListed();
+    error InventoryBreached();
+
     event BurnRouterUpdated(address router);
 
     /// @dev Wires the desk half of a strategy. A multiplier below `BPS` would list a holding for
@@ -108,10 +112,14 @@ abstract contract SweepDesk is SweepStrategy {
         emit ResaleTermsUpdated(multiplierBps, decayWindow);
     }
 
-    /// @notice Points the burn at a different router.
-    /// @dev Exists because a router is the kind of dependency that gets redeployed.
+    /// @notice Points the burn at a different router, which must be one the factory lists.
+    /// @dev Exists because a router is the kind of dependency that gets redeployed. The factory
+    /// gate is there because without it this setter is a drain — point the burn at a contract
+    /// that keeps the ETH and every queued sale proceeds is gone. Reached through the hook's
+    /// immutable factory address, so there is nothing here the owner can repoint first; the
+    /// zero address is never listed, so the old zero check is subsumed rather than dropped.
     function setBurnRouter(address router) external onlyOwner {
-        if (router == address(0)) revert InvalidConfiguration();
+        if (!ISweepFactory(ISweepHooked(hook).factory()).isRouter(router)) revert RouterNotListed();
         burnRouter = router;
         emit BurnRouterUpdated(router);
     }

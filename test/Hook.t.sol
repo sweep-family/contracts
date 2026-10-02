@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {LibClone} from "solady/src/utils/LibClone.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
@@ -90,8 +91,17 @@ contract HookTest is Test {
         factory.setRouter(address(swapRouter), true);
         collection = new OwnedCollection(creator);
 
-        strategy = new StrategyHarness();
-        strategy.initialize("Sweep Test", "SWEEP", HOOK_ADDRESS, address(manager), 0.001 ether, 10 ether, address(this));
+        strategy = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
+        strategy.initialize(
+            "Sweep Test",
+            "SWEEP",
+            HOOK_ADDRESS,
+            address(manager),
+            makeAddr("curve"),
+            0.001 ether,
+            10 ether,
+            address(this)
+        );
 
         deployCodeTo(
             "SweepHook.sol:SweepHook",

@@ -2,6 +2,10 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {LibClone} from "solady/src/utils/LibClone.sol";
+import {MockPoolLeg} from "./mocks/MockPoolLeg.sol";
+import {MockStrategyHook} from "./mocks/MockStrategyHook.sol";
+import {MockSweepFactory} from "./mocks/MockSweepFactory.sol";
 import {Ownable} from "solady/src/auth/Ownable.sol";
 
 import {SweepToken} from "../src/SweepToken.sol";
@@ -22,8 +26,11 @@ contract RecursiveStrategyTest is Test {
     SweepRecursiveStrategy internal strategy;
     MockBurnRouter internal router;
 
-    address internal hook = makeAddr("hook");
-    address internal poolManager = makeAddr("poolManager");
+    MockSweepFactory internal mockFactory = new MockSweepFactory(address(this));
+    address internal hook = address(new MockStrategyHook(address(mockFactory), makeAddr("protocol")));
+    address internal curveAddr = makeAddr("curve");
+    MockPoolLeg internal pool = new MockPoolLeg();
+    address internal poolManager = address(pool);
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
@@ -36,16 +43,16 @@ contract RecursiveStrategyTest is Test {
         vm.warp(1_788_000_000);
         router = new MockBurnRouter();
 
-        strategy = new SweepRecursiveStrategy();
+        strategy = SweepRecursiveStrategy(payable(LibClone.clone(address(new SweepRecursiveStrategy()))));
         strategy.initialize(_config(address(router), hook, poolManager, owner));
 
-        vm.startPrank(owner);
+        vm.prank(owner);
         strategy.setDistributor(address(this), true);
-        strategy.setDistributor(poolManager, true);
-        vm.stopPrank();
 
         strategy.transfer(address(router), ROUTER_INVENTORY);
-        strategy.transfer(poolManager, strategy.balanceOf(address(this)));
+        uint256 pooled = strategy.balanceOf(address(this));
+        strategy.approve(poolManager, pooled);
+        MockStrategyHook(payable(hook)).poolLeg(address(strategy), pool, address(this), poolManager, pooled);
 
         vm.deal(hook, 100 ether);
     }
@@ -65,7 +72,8 @@ contract RecursiveStrategyTest is Test {
     }
 
     function test_InitializeRefusesAZeroRouter() public {
-        SweepRecursiveStrategy fresh = new SweepRecursiveStrategy();
+        SweepRecursiveStrategy fresh =
+            SweepRecursiveStrategy(payable(LibClone.clone(address(new SweepRecursiveStrategy()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         fresh.initialize(_config(address(0), hook, poolManager, owner));
     }
@@ -289,10 +297,28 @@ contract RecursiveStrategyTest is Test {
 
     function test_ANewRouterIsExcludedToo() public {
         MockBurnRouter next = new MockBurnRouter();
+        mockFactory.setRouter(address(next), true);
         vm.prank(owner);
         strategy.setBurnRouter(address(next));
         assertTrue(strategy.excludedFromRewards(address(next)));
         assertEq(strategy.burnRouter(), address(next));
+    }
+
+    /// @notice An unlisted router is refused by name: this setter would
+    /// otherwise send every pending distribution to an arbitrary address.
+    function test_SetBurnRouterRefusesAnUnlistedRouter() public {
+        MockBurnRouter rogue = new MockBurnRouter();
+        vm.prank(owner);
+        vm.expectRevert(SweepRecursiveStrategy.RouterNotListed.selector);
+        strategy.setBurnRouter(address(rogue));
+    }
+
+    /// @notice The launch's curve and the factory are excluded from rewards at initialisation:
+    /// the curve holds the whole supply for the curve's life and the factory holds it for one
+    /// transaction at graduation, and neither is a holder.
+    function test_TheCurveAndTheFactoryAreExcludedAtInit() public view {
+        assertTrue(strategy.excludedFromRewards(curveAddr));
+        assertTrue(strategy.excludedFromRewards(address(this)));
     }
 
     /* ───────────────────────── conservation ─────────────────────────── */
@@ -346,14 +372,17 @@ contract RecursiveStrategyTest is Test {
 
     /* ───────────────────────────── helpers ──────────────────────────── */
 
+    /// @dev A pool leg, so it spends an allowance the hook grants in the same call, exactly as a
+    /// swap does: the lock admits no PoolManager movement without one, distributor or not.
     function _buy(address holder, uint256 amount) private {
-        vm.prank(poolManager);
-        strategy.transfer(holder, amount);
+        MockStrategyHook(payable(hook)).poolLeg(address(strategy), pool, poolManager, holder, amount);
     }
 
+    /// @dev The sell-side pool leg, under the same hook allowance.
     function _sell(address holder, uint256 amount) private {
         vm.prank(holder);
-        strategy.transfer(poolManager, amount);
+        strategy.approve(poolManager, amount);
+        MockStrategyHook(payable(hook)).poolLeg(address(strategy), pool, holder, poolManager, amount);
     }
 
     function _fund(uint256 amount) private {
@@ -363,7 +392,7 @@ contract RecursiveStrategyTest is Test {
 
     function _config(address burnRouter, address hook_, address poolManager_, address owner_)
         private
-        pure
+        view
         returns (SweepRecursiveStrategy.Config memory config)
     {
         config.burnRouter = burnRouter;
@@ -372,5 +401,6 @@ contract RecursiveStrategyTest is Test {
         config.hook = hook_;
         config.poolManager = poolManager_;
         config.owner = owner_;
+        config.curve = curveAddr;
     }
 }

@@ -74,11 +74,12 @@ contract PoolBypassTest is SweepForkTest {
         assertEq(s.balanceOf(trader), held, "the refusal still moved tokens");
     }
 
-    /// @notice The one hole the lock leaves, written down so it cannot surprise anyone: an address
-    /// the owner authorises is exempt, and can fund exactly the pool the test above refuses. The
-    /// authorisation is a single owner transaction on any of the three kinds, which is why this
-    /// power is the thing to close before mainnet rather than the lock itself.
-    function test_AnAuthorisedAddressCanFundASecondPool() public {
+    /// @notice The hole the lock still leaves, written down so it cannot surprise anyone: an
+    /// address the owner authorises is exempt from the wallet rule, so it can still send to a v2
+    /// pair or any other venue outside v4. What it can no longer do is fund a second v4 pool:
+    /// the PoolManager rule is read before the exemption, and a
+    /// distributor's leg into the PoolManager needs the hook's allowance like anyone's.
+    function test_AnAuthorisedAddressCannotFundASecondV4PoolButCanReachOtherVenues() public {
         (address strategy, PoolKey memory key) = _launch();
         SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
         _buy(key, 1 ether);
@@ -90,10 +91,12 @@ contract PoolBypassTest is SweepForkTest {
         uint256 held = s.balanceOf(trader);
         vm.startPrank(trader);
         s.approve(address(lpRouter), type(uint256).max);
+        vm.expectRevert(SweepToken.TransferNotAllowed.selector);
         lpRouter.modifyLiquidity(rival, _singleSided(rival, strategy), "");
+        s.transfer(address(pair), 1e18);
         vm.stopPrank();
 
-        assertLt(s.balanceOf(trader), held, "the authorised address funded nothing");
+        assertEq(s.balanceOf(trader), held - 1e18, "the authorised address lost its other exits");
     }
 
     /// @notice The same refusal covers every other venue a holder could reach for, since all of
@@ -124,6 +127,7 @@ contract PoolBypassTest is SweepForkTest {
         factory.setRecursiveImplementation(address(new SweepRecursiveStrategy()));
         vm.prank(trader);
         address strategy = factory.launchRecursive{value: LAUNCH_FEE}("Sweep Reflexive", "sREF");
+        _graduate(strategy);
         SweepRecursiveStrategy s = SweepRecursiveStrategy(payable(strategy));
 
         _buy(_poolKeyFor(strategy), 1 ether);

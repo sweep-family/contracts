@@ -89,16 +89,21 @@ contract SweepSwapRouter is IUnlockCallback {
      *
      * @dev Anything the pool did not consume is returned. A buy cannot run the pool out of tokens
      * short of buying the entire supply, so this is a wei of rounding at most, and it belongs to
-     * the caller rather than to a contract with no way to give it back later.
+     * the caller rather than to a contract with no way to give it back later. The refund is the
+     * growth of the router's balance over this call's own `msg.value`, never the whole balance:
+     * ETH force-sent here by `selfdestruct` would otherwise go to whoever bought next, a race
+     * only a bot wins.
      */
     function buy(address token, uint256 minOut, uint256 deadline) external payable returns (uint256 amountOut) {
         if (block.timestamp > deadline) revert Expired();
         if (!factory.isStrategy(token)) revert UnknownStrategy();
         if (msg.value == 0) revert NothingToSwap();
 
+        uint256 stray = address(this).balance - msg.value;
         amountOut = abi.decode(poolManager.unlock(abi.encode(token, msg.sender, true, msg.value, false)), (uint256));
         if (amountOut < minOut) revert TooLittleReceived(amountOut, minOut);
-        if (address(this).balance != 0) SafeTransferLib.safeTransferETH(msg.sender, address(this).balance);
+        uint256 change = address(this).balance - stray;
+        if (change != 0) SafeTransferLib.safeTransferETH(msg.sender, change);
         emit Swapped(token, msg.sender, true, msg.value, amountOut);
     }
 

@@ -23,6 +23,9 @@ import {ISweepFactory} from "../src/interfaces/ISweepFactory.sol";
 import {OwnedCollection} from "./mocks/OwnedCollection.sol";
 import {OwnerlessERC721} from "./mocks/OwnerlessERC721.sol";
 import {SweepForkTest} from "./shared/SweepForkTest.sol";
+import {SweepBondingCurve} from "../src/SweepBondingCurve.sol";
+import {FixedPointMathLib} from "solady/src/utils/FixedPointMathLib.sol";
+import {RejectingSink} from "./mocks/CurveTestActors.sol";
 
 /**
  * @title FactoryTest
@@ -39,61 +42,195 @@ contract FactoryTest is SweepForkTest {
     /// rather than derived from the ABI so that changing the event has to be a deliberate act here
     /// too, where an indexer would break.
     bytes32 internal constant LAUNCHED_TOPIC =
-        keccak256("StrategyLaunched(address,address,address,string,string,uint256,bool)");
+        keccak256("StrategyLaunched(address,address,address,string,string,address,bool)");
 
     /* ------------------------------------------------------------------ */
     /*                         the pool that gets born                     */
     /* ------------------------------------------------------------------ */
 
-    /// @notice The pool opens where the factory said it would, on the real PoolManager. If the
-    /// encoding of the multicall were wrong this is the first thing that would be silently off.
-    function test_LaunchCreatesAPoolAtTheIntendedPrice() public {
-        (address strategy, PoolKey memory key) = _launch();
+    /// @notice A launch creates a market, not a pool: the whole supply lands on the strategy's
+    /// own bonding curve, both directions of the mapping are recorded, and no v4 pool exists in
+    /// any form until graduation.
+    function test_LaunchMovesTheWholeSupplyToTheCurveAndNoPoolExists() public {
+        (address strategy, SweepBondingCurve curve) = _launchOnCurve();
+        SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
 
-        (uint160 sqrtPriceX96, int24 tick,,) = manager.getSlot0(key.toId());
-        assertEq(sqrtPriceX96, TickMath.getSqrtPriceAtTick(factory.TICK_UPPER()), "pool opened at the wrong price");
-        assertEq(tick, factory.TICK_UPPER(), "pool did not open at the top of the range");
-        assertEq(Currency.unwrap(key.currency1), strategy);
-        assertEq(Currency.unwrap(key.currency0), address(0));
+        assertEq(s.balanceOf(address(curve)), s.MAX_SUPPLY(), "the curve does not hold the supply");
+        assertEq(factory.curveOf(strategy), address(curve));
+        assertEq(factory.strategyOfCurve(address(curve)), strategy);
+        assertEq(factory.positionIdOf(strategy), 0, "a position id exists before graduation");
+        assertEq(curve.launcher(), launcher, "the snipe exemption missed the launcher");
+
+        (uint160 sqrtPriceX96,,,) = manager.getSlot0(_poolKeyFor(strategy).toId());
+        assertEq(sqrtPriceX96, 0, "a pool exists before graduation");
+    }
+
+    /// @notice The graduated pool opens at the curve's exact final spot price — the split
+    /// `tokenOut · ethOut / (ethOut + P)` is what makes the two prices the same number, and this
+    /// is the assertion that says the chart never jumps across graduation.
+    function test_GraduatedPoolOpensAtTheCurvesFinalPrice() public {
+        (address strategy, SweepBondingCurve curve) = _launchOnCurve();
+        vm.warp(block.timestamp + 5);
+        vm.prank(whale);
+        curve.buy{value: 20 ether}(0, whale);
+
+        uint256 ethOut = curve.trackedQuote();
+        uint256 tokenOut = curve.trackedTokens();
+        uint256 poolTokens = FixedPointMathLib.fullMulDiv(tokenOut, ethOut, ethOut + factory.PHANTOM_QUOTE());
+
+        factory.createGraduatedPool(strategy);
+
+        (uint160 sqrtPriceX96,,,) = manager.getSlot0(_poolKeyFor(strategy).toId());
+        uint160 expected = uint160(FixedPointMathLib.sqrt(FixedPointMathLib.fullMulDiv(poolTokens, 1 << 192, ethOut)));
+        assertEq(sqrtPriceX96, expected, "the pool did not open at the curve's final price");
     }
 
     /// @notice The liquidity is abandoned into the pool, not provided to it. Nobody holds the
-    /// position — not the launcher, not the collection, not us — so the curve cannot be pulled.
-    function test_LaunchMintsThePositionToTheDeadAddress() public {
+    /// position — not the launcher, not the collection, not us — so it cannot be pulled.
+    function test_GraduationMintsThePositionToTheDeadAddress() public {
         (address strategy,) = _launch();
 
         IERC721 posm = IERC721(address(factory.positionManager()));
         uint256 tokenId = factory.positionIdOf(strategy);
-        assertEq(posm.ownerOf(tokenId), DEAD_ADDRESS, "somebody owns the bonding curve");
+        assertTrue(tokenId != 0, "no position was recorded");
+        assertEq(posm.ownerOf(tokenId), DEAD_ADDRESS, "somebody owns the graduation position");
     }
 
-    /// @notice The point of opening at the top of the range: the position holds only tokens, so a
-    /// market opens with no capital at all. A launch costs the fee and nothing else.
+    /// @notice A launch costs the launcher the fee and nothing else — the pool's ETH comes from
+    /// the curve's buyers at graduation, never from the launcher.
     function test_LaunchCostsNothingBeyondTheFee() public {
-        uint256 before = launcher.balance;
-        _launch();
-        assertEq(launcher.balance, before - LAUNCH_FEE, "the launch consumed ETH beyond the fee");
+        uint256 balanceBefore = launcher.balance;
+        _launchOnCurve();
+        assertEq(launcher.balance, balanceBefore - LAUNCH_FEE, "the launch consumed ETH beyond the fee");
     }
 
-    /// @notice Liquidity rounds down, so a few wei never enter the position. Left in the factory
-    /// they would be stranded forever, and the transfer lock means they could not even be moved.
-    function test_LaunchLeavesNoTokensInTheFactory() public {
+    /// @notice Liquidity rounds down, so a few wei never enter the position; and the excess of
+    /// the reserved allocation is burnt by design. None of it may strand in the factory, where
+    /// the transfer lock would hold it forever.
+    function test_GraduationLeavesNoTokensAndNoEthInTheFactory() public {
         (address strategy,) = _launch();
         assertEq(SweepNFTStrategy(payable(strategy)).balanceOf(address(factory)), 0, "dust stranded in the factory");
+        assertEq(address(factory).balance, 0, "ETH stranded in the factory");
     }
 
-    /// @notice No team allocation, no treasury allocation, no vesting. Everything that exists is in
-    /// the pool or already burnt, and this is the assertion that says so.
-    function test_LaunchMintsTheWholeSupplyIntoThePool() public {
+    /// @notice A launch fee recipient that refuses ETH cannot hold graduations hostage. The
+    /// native rounding remainder of the seed goes to the dead address, which always accepts it;
+    /// sent to the fee recipient, a single wei of dust would revert every `createGraduatedPool`
+    /// until the owner changed the recipient.
+    function test_ARejectingLaunchFeeRecipientCannotBlockGraduation() public {
+        (address strategy,) = _launchOnCurve();
+        RejectingSink sink = new RejectingSink();
+        factory.setLaunchFee(LAUNCH_FEE, address(sink));
+
+        uint256 deadBefore = DEAD_ADDRESS.balance;
+        _graduate(strategy);
+
+        assertTrue(factory.positionIdOf(strategy) != 0, "the graduation did not settle");
+        assertGt(DEAD_ADDRESS.balance, deadBefore, "the seed's native dust did not go to the dead address");
+    }
+
+    /// @notice No team allocation, no treasury allocation, no vesting. After graduation every
+    /// token is in the pool, burnt at the dead address, or in the hands of whoever bought it on
+    /// the curve — and the burnt share is at least the reserved excess, `S·P²/(P+T)² ≈ 8.16%`.
+    function test_GraduationAccountsForTheWholeSupply() public {
         (address strategy,) = _launch();
         SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
 
         uint256 inPool = s.balanceOf(address(manager));
         uint256 burnt = s.balanceOf(DEAD_ADDRESS);
+        uint256 bought = s.balanceOf(whale);
 
         assertEq(s.totalSupply(), s.MAX_SUPPLY());
-        assertEq(inPool + burnt, s.MAX_SUPPLY(), "supply exists somewhere other than the pool");
+        assertEq(inPool + burnt + bought, s.MAX_SUPPLY(), "supply exists somewhere it should not");
+        assertGt(burnt, (s.MAX_SUPPLY() * 8) / 100, "the excess was not burnt");
         assertEq(s.balanceOf(launcher), 0, "the launcher kept some");
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                        graduation and its guards                    */
+    /* ------------------------------------------------------------------ */
+
+    /// @notice Graduation is refused by name for an address the factory never launched, for a
+    /// strategy still trading its curve, and a second time for one already pooled.
+    function test_CreateGraduatedPoolRefusesTheWrongMoment() public {
+        vm.expectRevert(SweepNFTStrategyFactory.UnknownStrategy.selector);
+        factory.createGraduatedPool(makeAddr("stranger"));
+
+        (address strategy,) = _launchOnCurve();
+        vm.expectRevert(SweepBondingCurve.NotGraduated.selector);
+        factory.createGraduatedPool(strategy);
+
+        _graduate(strategy);
+        vm.expectRevert(SweepNFTStrategyFactory.AlreadyPooled.selector);
+        factory.createGraduatedPool(strategy);
+    }
+
+    /// @notice Anyone may settle a graduated launch — the keeper is a convenience, never a
+    /// dependency — and the machine starts the moment the pool exists.
+    function test_AnyoneMaySettleAGraduatedLaunch() public {
+        (address strategy, SweepBondingCurve curve) = _launchOnCurve();
+        vm.warp(block.timestamp + 5);
+        vm.prank(whale);
+        curve.buy{value: 20 ether}(0, whale);
+
+        vm.prank(makeAddr("goodSamaritan"));
+        factory.createGraduatedPool(strategy);
+
+        _buy(_poolKeyFor(strategy), 1 ether);
+        assertGt(SweepNFTStrategy(payable(strategy)).treasury(), 0, "the machine did not start");
+    }
+
+    /// @notice The desk's bid ramp restarts at graduation: days spent on the curve must not open
+    /// the desk with the bid already at its ceiling.
+    function test_GraduationResetsTheBidRamp() public {
+        (address strategy, SweepBondingCurve curve) = _launchOnCurve();
+        vm.warp(block.timestamp + 30 days);
+        vm.prank(whale);
+        curve.buy{value: 20 ether}(0, whale);
+        factory.createGraduatedPool(strategy);
+
+        _buy(_poolKeyFor(strategy), 1 ether);
+        SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
+        assertGt(s.treasury(), 0);
+        assertEq(s.currentBid(), 0, "the ramp arrived at graduation already climbed");
+    }
+
+    /// @notice The base swap and burn routers can never be delisted, by anyone: with a
+    /// transfer-locked token they are the only market, so an owner who could empty the list
+    /// could freeze every holder's exit. An ordinary router still can be.
+    function test_PermanentRoutersCannotBeDelisted() public {
+        assertTrue(factory.isPermanentRouter(address(sweepRouter)));
+        assertTrue(factory.isPermanentRouter(address(burnRouter)));
+
+        vm.expectRevert(SweepNFTStrategyFactory.RouterPermanent.selector);
+        factory.setRouter(address(sweepRouter), false);
+
+        vm.expectRevert(SweepNFTStrategyFactory.RouterPermanent.selector);
+        factory.setRouter(address(burnRouter), false);
+
+        address ordinary = makeAddr("ordinaryRouter");
+        factory.setRouter(ordinary, true);
+        factory.setRouter(ordinary, false);
+        assertFalse(factory.isRouter(ordinary));
+
+        vm.prank(trader);
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        factory.setRouterPermanent(ordinary);
+    }
+
+    /// @notice The curve implementation setter refuses zero and refuses an implementation whose
+    /// economics disagree with the constants the factory splits reserves with — a drift there
+    /// would misprice every graduation silently.
+    function test_CurveImplementationRefusesMismatchedEconomics() public {
+        vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
+        factory.setCurveImplementation(address(0));
+
+        address wrong = address(new WrongEconomicsCurve());
+        vm.expectRevert(SweepNFTStrategyFactory.CurveEconomicsMismatch.selector);
+        factory.setCurveImplementation(wrong);
+
+        address right = address(new SweepBondingCurve());
+        factory.setCurveImplementation(right);
     }
 
     /* ------------------------------------------------------------------ */
@@ -164,6 +301,7 @@ contract FactoryTest is SweepForkTest {
         address second =
             factory.launch{value: LAUNCH_FEE}(address(collection), "Again", "AGAIN", BID_PER_SECOND, MAX_BID);
 
+        _graduate(second);
         _buy(firstKey, 1 ether);
         _buy(_poolKeyFor(second), 1 ether);
 
@@ -270,7 +408,7 @@ contract FactoryTest is SweepForkTest {
     /// it might be asked to account for.
     function test_LaunchFeeReachesTheRecipient() public {
         uint256 before = feeTo.balance;
-        _launch();
+        _launchOnCurve();
         assertEq(feeTo.balance, before + LAUNCH_FEE);
         assertEq(address(factory).balance, 0, "the factory kept the fee");
     }
@@ -450,7 +588,7 @@ contract FactoryTest is SweepForkTest {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i = 0; i < logs.length; i++) {
             if (logs[i].emitter == address(factory) && logs[i].topics[0] == LAUNCHED_TOPIC) {
-                (,,, bool verified) = abi.decode(logs[i].data, (string, string, uint256, bool));
+                (,,, bool verified) = abi.decode(logs[i].data, (string, string, address, bool));
                 return verified;
             }
         }
@@ -573,5 +711,21 @@ contract FactoryTest is SweepForkTest {
         (bool ok,) = address(factory).call{value: 1 ether}("");
         assertFalse(ok, "the factory accepted a donation");
         assertEq(address(factory).balance, 0);
+    }
+}
+
+/**
+ * @title WrongEconomicsCurve
+ * @author 0xDAVZER
+ * @notice Answers the two economics getters with numbers the factory's constants disagree with,
+ * so the setter's refusal can be watched happening.
+ */
+contract WrongEconomicsCurve {
+    function PHANTOM_QUOTE() external pure returns (uint256) {
+        return 1 ether;
+    }
+
+    function GRADUATION_THRESHOLD() external pure returns (uint256) {
+        return 4.2 ether;
     }
 }

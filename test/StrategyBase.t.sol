@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {LibClone} from "solady/src/utils/LibClone.sol";
 
 import {SweepStrategy} from "../src/SweepStrategy.sol";
 import {SweepToken} from "../src/SweepToken.sol";
@@ -22,6 +23,7 @@ contract StrategyBaseTest is Test {
 
     address internal hook = makeAddr("hook");
     address internal poolManager = makeAddr("poolManager");
+    address internal curve = makeAddr("curve");
     address internal router = makeAddr("router");
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice");
@@ -35,8 +37,8 @@ contract StrategyBaseTest is Test {
     /// anything that compares a timestamp against a duration. Start somewhere real.
     function setUp() public {
         vm.warp(1_788_000_000);
-        strategy = new StrategyHarness();
-        strategy.initialize("Phantom Strategy", "PHSTR", hook, poolManager, BID_PER_SECOND, MAX_BID, owner);
+        strategy = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
+        strategy.initialize("Phantom Strategy", "PHSTR", hook, poolManager, curve, BID_PER_SECOND, MAX_BID, owner);
     }
 
     /* ─────────────────────────── the token ─────────────────────────── */
@@ -110,6 +112,21 @@ contract StrategyBaseTest is Test {
         vm.prank(alice);
         vm.expectRevert();
         strategy.setDistributor(alice, true);
+    }
+
+    /// @notice The owner cannot change the curve's entry, in either direction.
+    /// @dev Delisting the curve would freeze every buy, every sell and the graduation itself,
+    /// holding the buyers' ETH on the curve at the owner's pleasure — an owner power over curve
+    /// reserves that the design says does not exist. Re-granting is
+    /// refused too, so the entry has one writer, initialisation.
+    function test_SetDistributorCannotTouchTheCurve() public {
+        vm.startPrank(owner);
+        vm.expectRevert(SweepToken.CurveDistributorFixed.selector);
+        strategy.setDistributor(curve, false);
+        vm.expectRevert(SweepToken.CurveDistributorFixed.selector);
+        strategy.setDistributor(curve, true);
+        vm.stopPrank();
+        assertTrue(strategy.isDistributor(curve));
     }
 
     /* ──────────────────────────── the bid ──────────────────────────── */
@@ -221,16 +238,17 @@ contract StrategyBaseTest is Test {
      * is motive enough.
      */
     function test_BurnPaysTheCallerExactly() public {
-        strategy.exposed_recordSale(1 ether);
+        uint256 pass = strategy.burnIncrement();
+        strategy.exposed_recordSale(pass);
         uint256 before = burner.balance;
 
         vm.prank(burner);
         (uint256 spent, uint256 reward) = strategy.processBurn();
 
-        uint256 expected = (1 ether * strategy.BURN_CALLER_REWARD_BPS()) / strategy.BPS();
+        uint256 expected = (pass * strategy.BURN_CALLER_REWARD_BPS()) / strategy.BPS();
         assertEq(reward, expected, "the reward is the published share");
         assertEq(burner.balance, before + expected, "and it actually arrives");
-        assertEq(spent, 1 ether - expected, "the remainder is what gets burnt");
+        assertEq(spent, pass - expected, "the remainder is what gets burnt");
     }
 
     /// @notice A second pass inside the cooldown is refused, which is what makes it a schedule
@@ -305,6 +323,31 @@ contract StrategyBaseTest is Test {
         pool.authoriseAndMoveTwice(s, alice, 5e18, 3e18, 3e18);
     }
 
+    /**
+     * @notice A distributor's leg through the PoolManager spends the hook's allowance like
+     * anyone's.
+     * @dev Read the other way round — the distributor exemption before the pool rule — a
+     * distributor could move tokens into or out of the PoolManager with no swap at all. The
+     * curve is a distributor: a curve buy delivered to the PoolManager inside an unlock would be
+     * minted as ERC-6909 claims that moved wallet to wallet and funded a hookless pool — the
+     * escape the router allow-list closes for swaps, reopened through the launch market.
+     */
+    function test_ADistributorLegThroughThePoolManagerSpendsTheAllowance() public {
+        (StrategyHarness s, SwapSimulator pool) = _strategyWithSimulatedPool();
+        s.exposed_credit(address(pool), 1000e18);
+        s.exposed_credit(curve, 1000e18);
+
+        vm.prank(curve);
+        vm.expectRevert(SweepToken.TransferNotAllowed.selector);
+        s.transfer(address(pool), 1e18);
+
+        vm.expectRevert(SweepToken.TransferNotAllowed.selector);
+        pool.authoriseAndMoveTwice(s, curve, 5e18, 3e18, 3e18);
+
+        pool.authoriseAndMove(s, curve, 3e18, 3e18);
+        assertEq(s.balanceOf(curve), 1003e18, "an authorised pool leg to a distributor was refused");
+    }
+
     /// @notice A grant is readable inside the transaction that made it, and nowhere else.
     function test_AllowanceIsVisibleOnlyWithinItsOwnTransaction() public {
         (StrategyHarness s, SwapSimulator pool) = _strategyWithSimulatedPool();
@@ -318,8 +361,8 @@ contract StrategyBaseTest is Test {
     /// `onlyHook` tests.
     function _strategyWithSimulatedPool() private returns (StrategyHarness s, SwapSimulator pool) {
         pool = new SwapSimulator();
-        s = new StrategyHarness();
-        s.initialize("Simulated", "SIM", address(pool), address(pool), BID_PER_SECOND, MAX_BID, owner);
+        s = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
+        s.initialize("Simulated", "SIM", address(pool), address(pool), curve, BID_PER_SECOND, MAX_BID, owner);
     }
 
     /**
@@ -355,23 +398,23 @@ contract StrategyBaseTest is Test {
 
     /// @notice A strategy with no hook could never be funded, so it is refused rather than deployed.
     function test_InitRefusesAZeroHook() public {
-        StrategyHarness fresh = new StrategyHarness();
+        StrategyHarness fresh = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
-        fresh.initialize("n", "s", address(0), poolManager, BID_PER_SECOND, MAX_BID, owner);
+        fresh.initialize("n", "s", address(0), poolManager, curve, BID_PER_SECOND, MAX_BID, owner);
     }
 
     /// @notice A zero cap would pin the bid at nothing, so the strategy could never buy.
     function test_InitRefusesAZeroMaxBid() public {
-        StrategyHarness fresh = new StrategyHarness();
+        StrategyHarness fresh = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
-        fresh.initialize("n", "s", hook, poolManager, BID_PER_SECOND, 0, owner);
+        fresh.initialize("n", "s", hook, poolManager, curve, BID_PER_SECOND, 0, owner);
     }
 
     /// @notice A zero ramp would leave the bid at zero forever, for the same reason.
     function test_InitRefusesAZeroRamp() public {
-        StrategyHarness fresh = new StrategyHarness();
+        StrategyHarness fresh = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
-        fresh.initialize("n", "s", hook, poolManager, 0, MAX_BID, owner);
+        fresh.initialize("n", "s", hook, poolManager, curve, 0, MAX_BID, owner);
     }
 
     /// @notice Name and symbol survive initialization, which is not free on a proxy where they
@@ -391,10 +434,33 @@ contract StrategyBaseTest is Test {
      */
     function test_OwnerCanRetuneTheBurnPacing() public {
         vm.prank(owner);
-        strategy.setBurnPacing(5 ether, 300);
+        strategy.setBurnPacing(0.2 ether, 300);
 
-        assertEq(strategy.burnIncrement(), 5 ether);
+        assertEq(strategy.burnIncrement(), 0.2 ether);
         assertEq(strategy.burnCooldown(), 300);
+    }
+
+    /// @notice A strategy opens with a burn pass of 0.1 ETH.
+    /// @dev The graduated pool's depth is fixed at its ~4.2 ETH seed, and
+    /// on a fork a one-transaction sandwich around a 1 ETH pass took about 6% of it; the scan
+    /// put the break-even near 0.33 ETH. The default sits a third of the way there, so the pool
+    /// can lose most of its ETH side before the default pass becomes worth sandwiching.
+    function test_BurnPassDefaultsToATenthOfAnEther() public view {
+        assertEq(strategy.burnIncrement(), 0.1 ether);
+    }
+
+    /// @notice No retune can push a pass above `MAX_BURN_INCREMENT`, the largest pass that still
+    /// loses money for a sandwich on a freshly graduated pool.
+    function test_BurnPacingRefusesAnIncrementAboveTheMaximum() public {
+        uint256 maximum = strategy.MAX_BURN_INCREMENT();
+        assertEq(maximum, 0.25 ether);
+
+        vm.startPrank(owner);
+        vm.expectRevert(SweepToken.InvalidConfiguration.selector);
+        strategy.setBurnPacing(maximum + 1, 60);
+        strategy.setBurnPacing(maximum, 60);
+        vm.stopPrank();
+        assertEq(strategy.burnIncrement(), maximum);
     }
 
     /// @notice A zero increment would make every pass a no-op that still consumed the cooldown,
@@ -437,7 +503,7 @@ contract StrategyBaseTest is Test {
         strategy.processBurn();
 
         vm.prank(owner);
-        strategy.setBurnPacing(1 ether, 1);
+        strategy.setBurnPacing(0.2 ether, 1);
 
         vm.warp(block.timestamp + 2);
         vm.prank(burner);
@@ -447,42 +513,90 @@ contract StrategyBaseTest is Test {
     /* ────────────────────── retuning the bid ───────────────────────── */
 
     /**
-     * @notice The owner can retune the bid after launch.
-     * @dev This matters more than the burn pacing and was missing for longer. A `maxBid` set too
-     * low at launch leaves a strategy unable to ever buy anything, with the treasury filling behind
-     * a ceiling it can never cross — and no way out short of upgrading the proxy.
+     * @notice The owner can retune the bid after launch, within the launch gates and the raise
+     * pacing. Replaces the unbounded setter's tests: the freedom they pinned was a drain, and the
+     * bounds remove it.
      */
-    function test_OwnerCanRetuneTheBid() public {
+    function test_OwnerCanRetuneTheBidWithinTheBounds() public {
+        vm.warp(block.timestamp + strategy.BID_RAISE_COOLDOWN());
         vm.prank(owner);
-        strategy.setBidParameters(0.05 ether, 20 ether);
+        strategy.setBidParameters(BID_PER_SECOND * 2, MAX_BID * 2);
 
-        assertEq(strategy.bidIncreasePerSecond(), 0.05 ether);
-        assertEq(strategy.maxBid(), 20 ether);
+        assertEq(strategy.bidIncreasePerSecond(), BID_PER_SECOND * 2);
+        assertEq(strategy.maxBid(), MAX_BID * 2);
     }
 
     /// @notice A retuned ramp changes the bid immediately, since nothing is stored.
     function test_RetunedRampChangesTheBidAtOnce() public {
         strategy.exposed_fund(100 ether);
-        vm.warp(block.timestamp + 100);
-        assertEq(strategy.currentBid(), 100 * BID_PER_SECOND);
+        vm.warp(block.timestamp + strategy.BID_RAISE_COOLDOWN());
+        uint256 elapsed = strategy.BID_RAISE_COOLDOWN();
+        assertEq(strategy.currentBid(), MAX_BID, "the ramp should have hit the ceiling");
 
         vm.prank(owner);
-        strategy.setBidParameters(BID_PER_SECOND * 2, MAX_BID);
-        assertEq(strategy.currentBid(), 100 * BID_PER_SECOND * 2, "recomputed on read, not stored");
+        strategy.setBidParameters(BID_PER_SECOND, MAX_BID / 2);
+        assertEq(strategy.currentBid(), MAX_BID / 2, "recomputed on read, not stored");
+        elapsed;
     }
 
-    /// @notice A zero ramp would pin the bid at nothing forever.
-    function test_BidParametersRefuseAZeroRamp() public {
+    /// @notice Raising either parameter is capped at double its current value — the cap cannot
+    /// be pointed at a whole treasury in one move.
+    function test_BidCapRaisesAtMostDoublePerRaise() public {
+        vm.warp(block.timestamp + strategy.BID_RAISE_COOLDOWN());
         vm.prank(owner);
+        vm.expectRevert(SweepStrategy.BidRaiseTooLarge.selector);
+        strategy.setBidParameters(BID_PER_SECOND, MAX_BID * 2 + 1);
+
+        vm.prank(owner);
+        vm.expectRevert(SweepStrategy.BidRaiseTooLarge.selector);
+        strategy.setBidParameters(BID_PER_SECOND * 2 + 1, MAX_BID);
+    }
+
+    /// @notice Raises are paced: a second raise inside the cooldown is refused, so walking the
+    /// cap up is a public, week-per-doubling affair rather than one transaction.
+    function test_BidRaisesArePacedToTheCooldown() public {
+        vm.prank(owner);
+        vm.expectRevert(SweepStrategy.BidRaiseTooSoon.selector);
+        strategy.setBidParameters(BID_PER_SECOND, MAX_BID * 2);
+
+        vm.warp(block.timestamp + strategy.BID_RAISE_COOLDOWN());
+        vm.prank(owner);
+        strategy.setBidParameters(BID_PER_SECOND, MAX_BID * 2);
+
+        vm.prank(owner);
+        vm.expectRevert(SweepStrategy.BidRaiseTooSoon.selector);
+        strategy.setBidParameters(BID_PER_SECOND, MAX_BID * 3);
+    }
+
+    /// @notice Lowering is always free and never touches the raise clock: an owner de-risking a
+    /// strategy must not lock themselves out of re-tuning it.
+    function test_LoweringTheBidIsAlwaysFree() public {
+        vm.prank(owner);
+        strategy.setBidParameters(BID_PER_SECOND / 2, MAX_BID / 2);
+
+        vm.warp(block.timestamp + strategy.BID_RAISE_COOLDOWN());
+        vm.prank(owner);
+        strategy.setBidParameters(BID_PER_SECOND, MAX_BID);
+        assertEq(strategy.maxBid(), MAX_BID);
+    }
+
+    /// @notice The absolute launch gates hold for the owner too: nothing outside
+    /// `[MIN_BID_INCREASE_PER_SECOND, MAX_BID_INCREASE_PER_SECOND]` and nothing above
+    /// `MAX_BID_CAP`, zero included.
+    function test_BidParametersRefuseTheLaunchGatesBounds() public {
+        vm.startPrank(owner);
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         strategy.setBidParameters(0, MAX_BID);
-    }
 
-    /// @notice A zero cap would do the same, from the other side.
-    function test_BidParametersRefuseAZeroCap() public {
-        vm.prank(owner);
         vm.expectRevert(SweepToken.InvalidConfiguration.selector);
         strategy.setBidParameters(BID_PER_SECOND, 0);
+
+        vm.expectRevert(SweepToken.InvalidConfiguration.selector);
+        strategy.setBidParameters(0.011 ether, MAX_BID);
+
+        vm.expectRevert(SweepToken.InvalidConfiguration.selector);
+        strategy.setBidParameters(BID_PER_SECOND, 101 ether);
+        vm.stopPrank();
     }
 
     /// @notice Only the owner may retune it.
@@ -490,5 +604,58 @@ contract StrategyBaseTest is Test {
         vm.prank(alice);
         vm.expectRevert();
         strategy.setBidParameters(BID_PER_SECOND, MAX_BID);
+    }
+
+    /* ────────────────────── graduation notice ───────────────────────── */
+
+    /// @notice Graduation resets the bid ramp: a launch that spent days on its curve must not
+    /// open its desk with the ramp fully climbed and the bid at the ceiling.
+    function test_MarkGraduatedResetsTheBidRamp() public {
+        strategy.exposed_fund(100 ether);
+        vm.warp(block.timestamp + 30 days);
+        assertEq(strategy.currentBid(), MAX_BID, "the ramp should have hit the ceiling");
+
+        vm.prank(curve);
+        strategy.markGraduated();
+        assertEq(strategy.currentBid(), 0, "the ramp did not restart");
+
+        vm.warp(block.timestamp + 10);
+        assertEq(strategy.currentBid(), 10 * BID_PER_SECOND);
+    }
+
+    /// @notice Only the curve may send the notice: a stranger who could reset the ramp at will
+    /// would hold the desk's bid at zero forever.
+    function test_OnlyTheCurveMayMarkGraduation() public {
+        vm.prank(alice);
+        vm.expectRevert(SweepToken.OnlyCurve.selector);
+        strategy.markGraduated();
+
+        vm.prank(owner);
+        vm.expectRevert(SweepToken.OnlyCurve.selector);
+        strategy.markGraduated();
+    }
+
+    /// @notice The curve is a distributor from initialisation — the factory's supply transfer
+    /// and every buyer's trade with the curve pass the lock — while wallet-to-wallet transfers
+    /// stay locked, which is what makes the curve the only pre-graduation market.
+    function test_CurveIsADistributorAndWalletsStayLocked() public {
+        assertTrue(strategy.isDistributor(curve));
+        assertEq(strategy.curve(), curve);
+
+        strategy.transfer(curve, 1000e18);
+        vm.prank(curve);
+        strategy.transfer(alice, 500e18);
+
+        vm.prank(alice);
+        vm.expectRevert(SweepToken.TransferNotAllowed.selector);
+        strategy.transfer(bob, 1e18);
+    }
+
+    /// @notice A zero curve is refused at initialisation: it would launch a token nobody could
+    /// ever buy.
+    function test_InitializeRefusesAZeroCurve() public {
+        StrategyHarness fresh = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
+        vm.expectRevert(SweepToken.InvalidConfiguration.selector);
+        fresh.initialize("n", "s", hook, poolManager, address(0), BID_PER_SECOND, MAX_BID, owner);
     }
 }
