@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {LibClone} from "solady/src/utils/LibClone.sol";
+import {SafeTransferLib} from "solady/src/utils/SafeTransferLib.sol";
 import {MockStrategyHook} from "./mocks/MockStrategyHook.sol";
 import {OperatorCollection, OperatorThiefMarketplace} from "./mocks/OperatorAttack.sol";
 import {MockSweepFactory} from "./mocks/MockSweepFactory.sol";
@@ -22,7 +23,7 @@ import {LyingCollection} from "./mocks/LyingCollection.sol";
  * @notice Pins the desk: what it will pay, what it proves after paying, what it asks, and where the
  * proceeds go.
  *
- * @dev The purchase tests lean on the fixtures' hostile venue, which exists precisely so each guard is
+ * @dev The purchase tests lean on brick 1's hostile venue, which exists precisely so each guard is
  * watched firing rather than believed. The ask tests cover the one real departure from the
  * reference — a descending price — and the failure it is there to prevent.
  */
@@ -89,14 +90,16 @@ contract NFTStrategyTest is Test {
         assertEq(collection.ownerOf(tokenId), address(strategy));
     }
 
-    /// @notice The treasury pays, and the bid restarts from nothing for the next seller.
-    function test_PurchaseSpendsTheTreasuryAndResetsTheBid() public {
+    /// @notice The treasury pays, and the bid gives up what the purchase spent (SC-07): a piece
+    /// bought at half the bid leaves the other half standing for the next seller.
+    function test_PurchaseSpendsTheTreasuryAndTheRampItUsed() public {
         _fund(5 ether);
         vm.warp(block.timestamp + 200);
+        uint256 bid = strategy.currentBid();
         uint256 tokenId = _listAndFill(1 ether);
 
         assertEq(strategy.treasury(), 4 ether);
-        assertEq(strategy.currentBid(), 0);
+        assertEq(strategy.currentBid(), bid - 1 ether);
         tokenId;
     }
 
@@ -122,15 +125,15 @@ contract NFTStrategyTest is Test {
     }
 
     /**
-     * @notice A fee credited while the purchase is still open must not be read as change.
+     * @notice Finding 3 of the pre-mainnet review: a fee credited while the purchase is still open
+     * must not be read as change.
      *
-     * @dev Were cost read as `ethBefore - address(this).balance`, then since `addFees` raises the
-     * balance and the treasury together, every wei that arrived during the venue call would count
-     * twice — once as a credit, once as a smaller cost. A venue that trades the strategy's own token
-     * before returning is enough: a 0.171 ETH bid paid out could book a cost of 0.089 and a ledger
-     * of 0.165 against 0.083 actually held. Two such purchases with proceeds queued leave
-     * `pendingBurn` above the balance and `processBurn` reverting for good, which destroys the burn
-     * rather than steals.
+     * @dev Cost was `ethBefore - address(this).balance`, and `addFees` raises the balance and the
+     * treasury together, so every wei that arrived during the venue call was counted twice — once
+     * as a credit, once as a smaller cost. On the fork this was a venue that trades the strategy's
+     * own token before returning: bid 0.171 ETH paid out, cost booked 0.089, ledger 0.165 against
+     * 0.083 actually held. Two such purchases with proceeds queued leave `pendingBurn` above the
+     * balance and `processBurn` reverting for good, which destroys the burn rather than steals.
      *
      * @dev The strategy here names the venue as its hook, because a unit test has no real hook to
      * make the credit arrive. What is pinned is the arithmetic: the treasury's own gain is added
@@ -173,13 +176,14 @@ contract NFTStrategyTest is Test {
     }
 
     /**
-     * @notice A purchase that costs nothing is refused.
+     * @notice Finding 4 of the pre-mainnet review: a purchase that costs nothing is refused.
      *
-     * @dev Without the guard, a venue that delivers the piece and refunds the whole price books
-     * `cost = 0`, which resets the bid ramp to zero and puts a piece on the shelf that
-     * `sellTargetNFT` refuses for ever after, since a zero cost is how "not held" is spelled. Anyone
-     * holding a piece of the collection could do it at will, one piece per reset, and front-run a
-     * genuine seller into `BidExceeded`. The bag desk refuses the same case with `NothingToSpend`.
+     * @dev A venue that delivers the piece and refunds the whole price booked `cost = 0`, which
+     * reset the bid ramp to zero and put a piece on the shelf that `sellTargetNFT` refuses for
+     * ever after, since a zero cost is how "not held" is spelled. Anyone holding a piece of the
+     * collection could do it at will, one piece per reset, and front-run a genuine seller into
+     * `BidExceeded`. The bag desk always refused this — `NothingToSpend` — and this is the same
+     * guard, arriving late.
      */
     function test_APurchaseThatCostsNothingIsRefused() public {
         _fund(5 ether);
@@ -303,14 +307,14 @@ contract NFTStrategyTest is Test {
         assertEq(strategy.askPrice(tokenId), 1 ether, "floored at cost, forever");
     }
 
-    /// @notice A zero window turns the decaying ask into a fixed price at cost times the multiplier.
+    /// @notice A zero window reproduces the reference's fixed price exactly.
     function test_AskIsFixedWhenTheWindowIsZero() public {
         vm.prank(owner);
         strategy.setResaleTerms(MULTIPLIER, 0);
 
         uint256 tokenId = _fundAndBuy(1 ether);
         vm.warp(block.timestamp + 365 days);
-        assertEq(strategy.askPrice(tokenId), 1.4 ether, "a zero window must never move the ask");
+        assertEq(strategy.askPrice(tokenId), 1.4 ether, "never moves, as the reference does not");
     }
 
     /// @notice Retuning the terms reprices inventory already held.
@@ -348,7 +352,37 @@ contract NFTStrategyTest is Test {
         assertEq(strategy.inventoryCount(), 0);
     }
 
-    /// @notice The exact ask is required, so a stale quote is refused rather than filled.
+    /// @notice The ask a buyer read has descended by the time the sale lands: the sale fills at
+    /// the ask in force, refunds the difference, and queues only that ask for burning.
+    function test_SaleAtAStaleAskFillsAtTheCurrentAskAndRefundsTheRest() public {
+        uint256 tokenId = _fundAndBuy(1 ether);
+        uint256 quoted = strategy.askPrice(tokenId);
+        vm.warp(block.timestamp + 1 hours);
+        uint256 current = strategy.askPrice(tokenId);
+        assertLt(current, quoted, "the ask did not descend");
+
+        hoax(buyer, 10 ether);
+        strategy.sellTargetNFT{value: quoted}(tokenId);
+
+        assertEq(collection.ownerOf(tokenId), buyer);
+        assertEq(buyer.balance, 10 ether - current, "the buyer paid more than the ask in force");
+        assertEq(strategy.pendingBurn(), current, "the queue took the overpayment");
+    }
+
+    /// @notice A buyer whose refund cannot be delivered does not buy: the sale reverts whole
+    /// rather than keeping the overpayment.
+    function test_SaleRevertsWhenTheRefundCannotBeDelivered() public {
+        uint256 tokenId = _fundAndBuy(1 ether);
+        uint256 ask = strategy.askPrice(tokenId);
+        EthRefuser refuser = new EthRefuser();
+        vm.deal(address(refuser), 10 ether);
+
+        vm.expectRevert(SafeTransferLib.ETHTransferFailed.selector);
+        refuser.buy(strategy, tokenId, ask + 1);
+        assertEq(collection.ownerOf(tokenId), address(strategy), "the piece left without the refund");
+    }
+
+    /// @notice Less than the ask is refused: a stale quote can only ever be too high, never short.
     function test_SaleRefusesTheWrongPayment() public {
         uint256 tokenId = _fundAndBuy(1 ether);
 
@@ -420,13 +454,13 @@ contract NFTStrategyTest is Test {
         tokenId = _listAndFill(price);
     }
 
-    /* the inventory walk */
+    /* the inventory walk (decision 0015) */
 
     /**
      * @notice A venue that delivers two junk pieces and lifts a held one through the
-     * collection's pre-approved operator passes every delivery check — balance net plus one,
-     * expected piece owned — and is caught only by the walk over the previous inventory. A
-     * proof-of-concept of this attack lands in exactly this shape.
+     * collection's pre-approved operator passes every pre-0015 check — balance net plus one,
+     * expected piece owned — and is caught only by the walk over the previous inventory. The
+     * partner's proof-of-concept for the 2026-09 review's point 12 lands in this shape.
      */
     function test_VenueThatLiftsInventoryThroughAnOperatorRevertsThePurchase() public {
         OperatorCollection oc = new OperatorCollection();
@@ -494,10 +528,9 @@ contract NFTStrategyTest is Test {
 
     /**
      * @notice A collection that pretends to transfer is caught before the listing is cleared.
-     * @dev A desk that deletes the entry first and ignores `transferFrom`'s outcome would, against
-     * a collection like this, take the buyer's payment, leave the piece where it is, and destroy the
-     * listing — nothing reverts, and the loss is silent. Transferring first and asserting ownership
-     * afterwards makes that failure revert.
+     * @dev This is the reference's ordering bug, made observable. It deletes the entry first and
+     * ignores `transferFrom`'s outcome, so against a collection like this the buyer pays, the piece
+     * never moves, and the listing is destroyed — nothing reverts, and the loss is silent.
      */
     function test_SaleDetectsACollectionThatDoesNotDeliver() public {
         LyingCollection liar = new LyingCollection();
@@ -606,7 +639,7 @@ contract NFTStrategyTest is Test {
 
     /// @notice The router can be repointed to one the factory lists, because routers get
     /// redeployed — and only to one the factory lists, because pointing the burn anywhere else
-    /// is a drain on every queued sale.
+    /// is a drain on every queued sale (decision 0015).
     function test_OwnerCanRepointTheBurnRouterToAListedOne() public {
         MockBurnRouter replacement = new MockBurnRouter();
         mockFactory.setRouter(address(replacement), true);
@@ -671,5 +704,18 @@ contract NFTStrategyTest is Test {
         config.askDecayWindow = askDecayWindow_;
         config.owner = owner_;
         config.curve = curveAddr;
+    }
+}
+
+/// @notice A buyer that refuses ETH, so a refund to it cannot be delivered.
+contract EthRefuser {
+    /// @notice Buys `tokenId` from `desk`, paying `value`.
+    function buy(SweepNFTStrategy desk, uint256 tokenId, uint256 value) external {
+        desk.sellTargetNFT{value: value}(tokenId);
+    }
+
+    /// @notice Accepts the piece.
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
     }
 }

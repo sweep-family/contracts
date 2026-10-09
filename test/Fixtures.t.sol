@@ -22,7 +22,7 @@ import {HostileMarketplace, Betrayal} from "./mocks/HostileMarketplace.sol";
 /**
  * @title FixturesTest
  * @author 0xDAVZER
- * @notice Pins the behaviour every later contract assumes of its test fixtures.
+ * @notice Pins the behaviour every later brick assumes of its test fixtures.
  *
  * @dev These are not tests of the protocol. They are tests of the instruments the protocol will be
  * measured with, and they exist first because the protocol's most dangerous function makes an
@@ -48,8 +48,8 @@ contract FixturesTest is Test {
     /**
      * @notice The launch factory gates on exactly this interface id and rejects everything else.
      * @dev It is also why CryptoPunks can never use a generic NFT strategy: Punks predate ERC-721
-     * and implement no `supportsInterface` at all, so they would need a bespoke strategy of their
-     * own. A fixture failing this would make every later launch test revert for a reason
+     * and implement no `supportsInterface` at all, which is why TokenWorks wrote a bespoke
+     * PunkStrategy. A fixture failing this would make every later launch test revert for a reason
      * that looks unrelated to the collection.
      */
     /// @notice `tokenURI` is the base followed by the decimal id, which is the scheme of the real
@@ -190,7 +190,7 @@ contract FixturesTest is Test {
     /**
      * @notice A venue can call back into its caller mid-purchase.
      * @dev Nothing to reenter into yet, so this only pins that the callback fires and is
-     * observable. `NFTStrategy.t.sol` points it at the strategy, where the reentrancy guard has to stop it.
+     * observable. Brick 3 points it at the strategy, where the reentrancy guard has to stop it.
      */
     function test_VenueCanReenterItsCaller() public {
         uint256 tokenId = collection.mint(address(hostile));

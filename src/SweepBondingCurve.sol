@@ -25,27 +25,33 @@ import {ISweepCurveHook, ISweepCurveToken} from "./interfaces/ISweepBondingCurve
  * @author 0xDAVZER
  * @notice The launch market. One clone per launch holds the strategy token's entire supply and
  * trades it against a virtual 1.68 ETH reserve until 4.2 ETH of real ETH has come in; the buy
- * that crosses the line graduates the launch, and the factory then moves everything here into
- * the strategy's Uniswap v4 pool at this curve's exact final price.
+ * that crosses the line graduates the launch, and the factory then moves the reserves into the
+ * strategy's Uniswap v4 pool at this curve's exact final price (decision 0013). The fees owed at
+ * that moment stay here until anyone sweeps them to their fixed recipients.
  *
- * @dev The quote asset is fixed to native ETH. That single narrowing removes any need for
- * fee-on-transfer accounting, blocklist failure modes, and the owner rescue path those would
- * exist to serve: this contract has no owner, no setters and no rescue, and its reserves can only
- * ever move toward the pool.
+ * @dev Rebuilt from `reference/pons/PonsV2BondingCurve.sol` with the quote asset fixed to
+ * native ETH. That single narrowing deletes Pons's fee-on-transfer accounting, its blocklist
+ * failure modes, and the owner rescue path those existed to serve: this contract has no owner,
+ * no setters and no rescue, and its reserves can only ever move toward the pool
+ * (decision 0014).
  *
  * @dev The reserves are counters — `trackedQuote`, `trackedTokens` — never balances. ETH forced
  * in by `selfdestruct` or tokens transferred straight in sit outside the books: they move no
  * price, bring graduation no closer, and are stranded here rather than folded into the pool's
- * seed. The economics are compile-time constants for the same reason `FEE_BPS` is one on the
- * hook: the protocol has decided them once, for everyone, and a per-launch parameter would only
- * be a way to mis-set them.
+ * seed. The fees and the snipe tax are compile-time constants for the same reason `FEE_BPS` is
+ * one on the hook: the protocol has decided them once, for everyone. The two quantities that set
+ * the curve's scale — the virtual reserve and the graduation threshold — are immutables fixed when
+ * the implementation is deployed, so every clone of one implementation shares them and no launch
+ * can choose its own. Mainnet uses 1.68 and 4.2 ETH, and the deploy script refuses anything else
+ * there; a testnet stack may scale both by the same factor, which keeps every ratio — the 2/7
+ * reserved, the 12.25x final price, the 4/49 burnt — and only shrinks the ETH a graduation costs.
  */
 contract SweepBondingCurve is Initializable, ReentrancyGuard {
-    /// @notice The virtual ETH the pricing starts against: an opening FDV of 1.68 ETH.
-    uint256 public constant PHANTOM_QUOTE = 1.68 ether;
+    /// @notice The virtual ETH the pricing starts against: an opening FDV of 1.68 ETH on mainnet.
+    uint256 public immutable PHANTOM_QUOTE;
 
-    /// @notice The real ETH that ends the curve and seeds the pool.
-    uint256 public constant GRADUATION_THRESHOLD = 4.2 ether;
+    /// @notice The real ETH that ends the curve and seeds the pool: 4.2 ETH on mainnet.
+    uint256 public immutable GRADUATION_THRESHOLD;
 
     /// @notice The protocol's cut of every trade's quote leg.
     uint256 public constant CURVE_FEE_BPS = 100;
@@ -84,8 +90,10 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     /// @notice When trading opened, which anchors the snipe tax's decay.
     uint256 public launchedAt;
 
-    /// @notice Every wei that entered through a buy and has not left through a sell or a fee
-    /// sweep. The fee buckets below are earmarks inside this number, not additions to it.
+    /// @notice Every wei that entered through a buy and has not left through a sell, a fee sweep
+    /// or the graduation handover. The fee buckets below are earmarks inside this number, not
+    /// additions to it, and they outlive the handover: after it, this number is exactly the fees
+    /// still owed.
     uint256 public trackedQuote;
 
     /// @notice Every token the curve holds for sale or for the pool. Donated tokens are not in
@@ -102,12 +110,12 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     /// @notice Quote fees owed to the creator.
     uint256 public creatorFeeBalance;
 
-    /// @notice Set by `graduate`, before anything else it does. Once true, trading is over for
-    /// good and the only remaining move is the factory's `completeGraduation`.
+    /// @notice Set by `graduate`, which does nothing else. Once true, trading is over for good and
+    /// the only remaining moves are the factory's `completeGraduation` and the fee sweep.
     bool public graduated;
 
     /// @dev One buy's pricing, boxed so the hot path fits the reachable stack without `via_ir`,
-    /// which `forge coverage` cannot run.
+    /// which `forge coverage` cannot run (see contracts/CLAUDE.md on stack-too-deep).
     struct BuyQuote {
         uint256 spent;
         uint256 fee;
@@ -161,7 +169,12 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
 
     /// @dev The implementation behind the clones must not be initializable by a stranger, who
     /// would otherwise own a contract at the very address the deployment record names.
-    constructor() {
+    /// `InvalidLaunchEconomics` refuses a zero reserve or threshold: a zero virtual reserve prices
+    /// the first token at nothing, and a zero threshold graduates on the first wei.
+    constructor(uint256 phantomQuote_, uint256 graduationThreshold_) {
+        if (phantomQuote_ == 0 || graduationThreshold_ == 0) revert InvalidLaunchEconomics();
+        PHANTOM_QUOTE = phantomQuote_;
+        GRADUATION_THRESHOLD = graduationThreshold_;
         _disableInitializers();
     }
 
@@ -266,13 +279,15 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
      * @dev Refused not just once `graduated` but already when `readyToGraduate()`: between the
      * crossing buy and the flag there is a window where the curve is full, and a sell landing in
      * it would push tokens back and pull ETH out, seeding the pool deeper and cheaper than the
-     * reserved allocation fixes it.
+     * reserved allocation fixes it (Pons closes the same window, `PonsV2BondingCurve.sol:522`).
      * Nobody is stranded: `graduate` is permissionless, so a blocked seller can settle the
      * launch themselves and trade the pool in the same transaction.
      *
-     * `InvalidRecipient` refuses the factory as the payee. The factory admits ETH from any curve
-     * it deployed, because that is how graduation reserves arrive, and has no function that sends
-     * ETH on: a sale paid there would strand the seller's ETH for good.
+     * `InvalidRecipient` refuses two payees that would strand the seller's ETH for good. The
+     * factory admits ETH from any curve it deployed, because that is how graduation reserves
+     * arrive, and has no function that sends ETH on (audit 2026-10-02, L-2). The token is the
+     * strategy, whose `receive` takes ETH from marketplaces and desk buyers into no ledger, and
+     * whose address is the one a front end shows most.
      *
      * The reserves are read before the tokens are pulled in, so the trade prices against the
      * pre-trade state. `trackedQuote` loses only the net payout: the fee wei stay in the
@@ -286,7 +301,7 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
         if (graduated || readyToGraduate()) revert CurveGraduated();
         if (tokensIn == 0) revert ZeroAmount();
         if (recipient == address(0)) revert ZeroAddress();
-        if (recipient == factory) revert InvalidRecipient();
+        if (recipient == factory || recipient == token) revert InvalidRecipient();
 
         (uint256 quoteReserve, uint256 tokenReserve) = getReserves();
         SafeTransferLib.safeTransferFrom(token, msg.sender, address(this), tokensIn);
@@ -308,28 +323,37 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     }
 
     /**
-     * @notice Marks the curve graduated and sweeps the fee buckets. Permissionless: the natural
-     * caller is the crossing buy itself, and after a gas-starved failure, anyone.
+     * @notice Marks the curve graduated. Permissionless: the natural caller is the crossing buy
+     * itself, and after a failed auto-graduation, anyone.
      *
-     * @dev Deliberately not `nonReentrant`, because it is invoked from inside `buy`'s own
-     * guarded scope through the external self-call in `_tryAutoGraduate`. `graduated = true` is
-     * written before the sweep pays a single wei: the sweep's ETH sends can hand control to a
-     * recipient, and the flag is the only thing closing `buy` and `sell` at that instant —
-     * re-entering while it was still false would let a recipient refill fee buckets that had
-     * already been zeroed.
+     * @dev It flips the flag and pays nobody: the fee buckets stay owed, inside `trackedQuote`,
+     * until the permissionless `sweepFees` pays them, before or after the factory takes the
+     * reserves. That absence is the guard. Graduation used to sweep the fees, and a fee recipient
+     * that burns its whole force-send stipend made it cost more than the 63/64 share the crossing
+     * buy's self-call gets at a wallet's own gas estimate, so the buy landed with
+     * `AutoGraduationFailed` and every such launch waited on the keeper to be settled (e2e
+     * mainnet-fork finding, 2026-10-05). With no external call in it, graduation costs the same
+     * one storage write and one event whoever the recipients are, and hands control to nobody,
+     * so no recipient can starve it, block it, or re-enter it.
+     *
+     * `AlreadyGraduated` refuses a second call, which would emit a lying event. `NotReadyToGraduate`
+     * refuses a curve that still has tokens to sell: flagging it would close trading early and
+     * hand the factory a shallow seed priced off a curve that never filled. Deliberately not
+     * `nonReentrant`, because it is invoked from inside `buy`'s own guarded scope through the
+     * external self-call in `_tryAutoGraduate`.
      */
     function graduate() external {
         if (graduated) revert AlreadyGraduated();
         if (!readyToGraduate()) revert NotReadyToGraduate();
 
         graduated = true;
-        _sweepFees();
-        emit Graduated(trackedQuote, trackedTokens);
+        emit Graduated(realQuoteReserve(), trackedTokens);
     }
 
     /**
-     * @notice Hands every tracked wei and token to the factory, which is seeding the pool with
-     * them in this same transaction.
+     * @notice Hands the real reserve and every tracked token to the factory, which is seeding the
+     * pool with them in this same transaction. The fees still owed stay here, earmarked, for
+     * `sweepFees`.
      *
      * @dev `OnlyFactory` because the reserves are the pool's seed and nothing else may ever
      * receive them; `NotGraduated` because taking them earlier would strand traders on a live
@@ -337,17 +361,26 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
      * and emit a lying event. The factory calls this inside `createGraduatedPool`, so the
      * reserves are only ever on the curve or in the pool — a failed seed reverts the whole
      * transaction back to a halted, solvent, retryable curve, which is why no rescue function
-     * exists. The token is told `markGraduated` before the transfers: the strategy uses it to
-     * reset its bid ramp, and it must observe graduation before any balance moves.
+     * exists (decision 0014). The token is told `markGraduated` before the transfers: the
+     * strategy uses it to reset its bid ramp, and it must observe graduation before any balance
+     * moves.
+     *
+     * @dev The ETH handed over is `realQuoteReserve()`, never `trackedQuote`: graduation no longer
+     * sweeps the buckets, so `trackedQuote` may still hold fees owed to the protocol and the
+     * creator, and handing it over whole would seed the pool with their money and leave
+     * `sweepFees` paying out of an empty balance. `trackedQuote` keeps exactly the owed fees, so
+     * the books still equal the balance, a later `sweepFees` pays them to the same fixed
+     * recipients and zeroes it, and the seed is the same 4.2 ETH whether the fees were swept
+     * before the handover or after.
      */
     function completeGraduation() external nonReentrant returns (uint256 ethOut, uint256 tokenOut) {
         if (msg.sender != factory) revert OnlyFactory();
         if (!graduated) revert NotGraduated();
 
-        ethOut = trackedQuote;
+        ethOut = realQuoteReserve();
         tokenOut = trackedTokens;
         if (tokenOut == 0) revert NothingToComplete();
-        trackedQuote = 0;
+        trackedQuote -= ethOut;
         trackedTokens = 0;
 
         ISweepCurveToken(token).markGraduated();
@@ -358,13 +391,49 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     }
 
     /**
-     * @notice Pays the fee buckets out. Permissionless, so the keeper is a convenience and not a
-     * dependency; reverts on empty buckets so a mis-scheduled sweep reads as a revert rather
-     * than a silent success.
+     * @notice Pays the fee buckets out to their fixed recipients. Permissionless, so the keeper is
+     * a convenience and not a dependency, and callable at every stage of the curve's life: while
+     * it trades, once it has graduated, and after the factory has taken the reserves. Graduation
+     * pays nobody, so this is the only path the fees owed at graduation leave by.
+     *
+     * @dev `NothingToSweep` reverts on empty buckets so a mis-scheduled sweep reads as a revert
+     * rather than a silent success.
+     *
+     * The buckets are zeroed and their wei released from `trackedQuote` before a single wei
+     * leaves, and the function holds the reentrancy lock: a recipient handed control by the
+     * payment finds nothing left to sweep and cannot trade, so it cannot refill the buckets it is
+     * being paid out of (`PonsV2BondingCurve.sol:598-614`). On a graduated curve the flag refuses
+     * that trade as well.
+     *
+     * Both payments are forced: a recipient that reverts on receive, or burns every drop of gas
+     * it is sent, is paid through the selfdestruct fallback instead of blocking the other bucket.
+     * The protocol's recipient is read live off the hook so the one setter that governs protocol
+     * revenue governs all of it; a zero creator folds into the protocol, mirroring the hook's
+     * `_distribute`. Neither recipient can be changed here, so owed fees cannot be redirected by
+     * when they are swept.
      */
     function sweepFees() external nonReentrant {
-        if (protocolFeeBalance + creatorFeeBalance == 0) revert NothingToSweep();
-        _sweepFees();
+        uint256 protocolAmount = protocolFeeBalance;
+        uint256 creatorAmount = creatorFeeBalance;
+        if (protocolAmount + creatorAmount == 0) revert NothingToSweep();
+
+        protocolFeeBalance = 0;
+        creatorFeeBalance = 0;
+        trackedQuote -= protocolAmount + creatorAmount;
+
+        address creator = creatorFeeRecipient;
+        if (creator == address(0)) {
+            protocolAmount += creatorAmount;
+            creatorAmount = 0;
+        }
+
+        if (protocolAmount != 0) {
+            SafeTransferLib.forceSafeTransferETH(ISweepCurveHook(hook).protocolFeeRecipient(), protocolAmount);
+        }
+        if (creatorAmount != 0) {
+            SafeTransferLib.forceSafeTransferETH(creator, creatorAmount);
+        }
+        emit FeesSwept(protocolAmount, creatorAmount);
     }
 
     /// @notice The reserves the pricing sees: the phantom plus every tracked wei not earmarked
@@ -449,7 +518,7 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
      * keeps the clamp's gross-up denominator away from zero. A fill larger than the sellable
      * remainder is clamped to it: the needed net input is re-derived from the token side, then
      * grossed back up for the three fee legs, rounded up so the reserves never lose the wei, and
-     * capped at what was actually sent.
+     * capped at what was actually sent (`PonsV2BondingCurve.sol:483-495`).
      */
     function _priceBuy(uint256 received, address recipient) private view returns (BuyQuote memory quote) {
         if (graduated) revert CurveGraduated();
@@ -489,44 +558,13 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     }
 
     /**
-     * @dev Zeroes both buckets, releases their wei from the tracked quote, and pays them out by
-     * force. The force-send is the guard: a recipient that reverts on receive must not be able
-     * to block the crossing buy's automatic sweep or hold the other bucket hostage — the same
-     * reasoning that already pays `processBurn`'s caller by force. The protocol's recipient is
-     * read live off the hook so the one setter that governs protocol revenue governs all of it;
-     * a zero creator folds into the protocol, mirroring the hook's `_distribute`. Tolerates
-     * empty buckets silently because `graduate` calls it unconditionally; the external
-     * `sweepFees` is the one that treats empty as a mistake.
-     */
-    function _sweepFees() private {
-        uint256 protocolAmount = protocolFeeBalance;
-        uint256 creatorAmount = creatorFeeBalance;
-        if (protocolAmount + creatorAmount == 0) return;
-
-        protocolFeeBalance = 0;
-        creatorFeeBalance = 0;
-        trackedQuote -= protocolAmount + creatorAmount;
-
-        address creator = creatorFeeRecipient;
-        if (creator == address(0)) {
-            protocolAmount += creatorAmount;
-            creatorAmount = 0;
-        }
-
-        if (protocolAmount != 0) {
-            SafeTransferLib.forceSafeTransferETH(ISweepCurveHook(hook).protocolFeeRecipient(), protocolAmount);
-        }
-        if (creatorAmount != 0) {
-            SafeTransferLib.forceSafeTransferETH(creator, creatorAmount);
-        }
-        emit FeesSwept(protocolAmount, creatorAmount);
-    }
-
-    /**
      * @dev Settles the launch the instant a buy fills the curve, without ever failing the buy.
-     * The external self-call is what buys try/catch; the event is what lets the keeper notice a
-     * crossing buy whose caller starved graduation of gas under the 63/64 rule and finish the
-     * job permissionlessly.
+     * The external self-call is what buys try/catch. Graduation makes no external call, so its
+     * cost does not depend on any recipient, and a buy with gas enough to finish after the call
+     * always gave the call enough under the 63/64 rule; the catch stays because the self-call is
+     * still an external call, and a failure there must never take the user's trade down with it.
+     * The event is what lets the keeper notice a crossing buy that did not graduate and finish
+     * the job permissionlessly.
      */
     function _tryAutoGraduate() private {
         if (!readyToGraduate()) return;

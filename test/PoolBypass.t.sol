@@ -23,8 +23,9 @@ import {TargetToken} from "./mocks/TargetToken.sol";
  * @notice The attack the fee depends on being impossible: opening a second pool on a strategy's
  * token, one that our hook does not sit on, and trading there for free.
  *
- * @dev This is not hypothetical: a second venue is what a holder reaches for the moment a 10%
- * toll exists, and a token shipped without the lock cannot be fixed. So the property is pinned
+ * @dev This is not hypothetical. The reference shipped its first token without a transfer lock,
+ * and a second venue is what a holder reaches for the moment a 10% toll exists. Every later
+ * token in that family has the lock; the first one cannot be fixed. So the property is pinned
  * here, on the real PoolManager rather than a mock, for every kind of strategy: a rival pool can
  * be *created* — v4 lets anyone initialise any pair — and can never be *funded*, which is what
  * makes it harmless.
@@ -35,10 +36,12 @@ import {TargetToken} from "./mocks/TargetToken.sol";
  * rival pool is none of them: the liquidity router pulls the token straight to the PoolManager,
  * and no swap of ours has authorised a wei of it.
  *
- * @dev **That lock is not the whole story.** v4 also keeps ERC-6909 claim balances, a swapper may
+ * @dev **That lock was not the whole story, and this file said it was.** The pre-mainnet review of
+ * 22 September 2026 found the way past it: v4 also keeps ERC-6909 claim balances, a swapper may
  * take its output as claims instead of ERC-20, and claims move wallet to wallet through the
- * PoolManager without ever touching the token. A test that only ever takes its output as ERC-20
- * cannot fail on that path, so the claim path is exercised here too, and what closes it is a
+ * PoolManager without ever touching the token. Every test below passed while that hole was open,
+ * because every one of them took its output as ERC-20. A test that cannot fail on the thing it
+ * pins is worse than no test, so the claim path is exercised here now, and what closes it is a
  * second gate: the hook refuses a swap whose caller is not a router the factory allows, and every
  * allowed router settles in ERC-20. No claim on a strategy's token can come into existence.
  */
@@ -77,7 +80,7 @@ contract PoolBypassTest is SweepForkTest {
     /// @notice The hole the lock still leaves, written down so it cannot surprise anyone: an
     /// address the owner authorises is exempt from the wallet rule, so it can still send to a v2
     /// pair or any other venue outside v4. What it can no longer do is fund a second v4 pool:
-    /// the PoolManager rule is read before the exemption, and a
+    /// since audit H-1 of 2026-10-02 the PoolManager rule is read before the exemption, and a
     /// distributor's leg into the PoolManager needs the hook's allowance like anyone's.
     function test_AnAuthorisedAddressCannotFundASecondV4PoolButCanReachOtherVenues() public {
         (address strategy, PoolKey memory key) = _launch();
@@ -182,11 +185,11 @@ contract PoolBypassTest is SweepForkTest {
         assertEq(manager.balanceOf(trader, uint256(uint160(strategy))), 0, "a claim was minted");
     }
 
-    /// @notice The claim escape, walked in reverse. Its first step is a buy that takes the output
-    /// as ERC-6909 claims, from which a hookless pool is funded and traded on for free, paying us
-    /// nothing forever. That first step is the one that reverts, so none of the rest can be
-    /// reached: no claim exists to move, to fund with, or to trade.
-    function test_TheClaimEscapeNeverStarts() public {
+    /// @notice The review's own reproduction, in reverse. Its first step was a buy that took the
+    /// output as ERC-6909 claims, from which it funded a hookless pool and traded there for free,
+    /// paying us nothing forever. That first step is now the one that reverts, so none of the rest
+    /// can be reached: no claim exists to move, to fund with, or to trade.
+    function test_TheClaimEscapeOfTheReviewNoLongerStarts() public {
         (address strategy, PoolKey memory key) = _launch();
         SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
         vm.warp(block.timestamp + 90 minutes);
@@ -213,8 +216,8 @@ contract PoolBypassTest is SweepForkTest {
 
     /// @notice The residual power, stated rather than hidden: the allow-list is trust, not proof.
     /// The hook asks the factory whether a caller is a router and believes the answer, so an owner
-    /// who adds a router that takes its output as claims reopens exactly the claim escape. Both
-    /// routers we ship settle in ERC-20 and are the only two the deploy script adds.
+    /// who adds a router that takes its output as claims reopens exactly the hole the review
+    /// found. Both routers we ship settle in ERC-20 and are the only two the deploy script adds.
     /// This is an owner power of the same weight as `setDistributor`, and it is disclosed with it.
     function test_AnApprovedRouterIsTrustedRatherThanChecked() public {
         (address strategy, PoolKey memory key) = _launch();

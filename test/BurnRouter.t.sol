@@ -23,7 +23,7 @@ contract BurnProbe {
 /**
  * @title BurnRouterTest
  * @author 0xDAVZER
- * @notice The strategy's `processBurn` is the caller throughout, because that is the only
+ * @notice Brick 6. The strategy's `processBurn` is the caller throughout, because that is the only
  * caller the router will ever have and the accounting is theirs jointly.
  */
 contract BurnRouterTest is SweepForkTest {
@@ -62,7 +62,7 @@ contract BurnRouterTest is SweepForkTest {
     /// @notice The burn goes through the pool, the pool names the hook, and the router is not the
     /// hook — so the burn pays the fee, and eighty percent of it comes straight back as treasury.
     /// A number, not a sentence: the treasury rises during a burn with no trade having happened.
-    /// @dev The tolerance is 6%, not exact: since graduation the pool carries the curve's
+    /// @dev The tolerance is 6%, not exact: since decision 0013 the pool carries the curve's
     /// 4.2 ETH of real depth rather than the old bottomless single-sided ramp, so the burn's own
     /// swap moves the price it converts its fee at by a visible amount.
     function test_BurnPaysTheHookFeeAndRecyclesEightyPercentOfIt() public {
@@ -83,7 +83,7 @@ contract BurnRouterTest is SweepForkTest {
         assertApproxEqRel(fee, spent / 10, 0.06e18, "the fee is not a tenth of the burn");
     }
 
-    /// @notice The hook's invariant, read from inside the transaction: the router takes to itself
+    /// @notice Brick 4's invariant, read from inside the transaction: the router takes to itself
     /// rather than straight to the dead address precisely so the hook's authorisation is spent.
     function test_BurnLeavesNoTransferAllowanceBehind() public {
         BurnProbe probe = new BurnProbe();

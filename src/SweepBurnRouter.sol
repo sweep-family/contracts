@@ -20,6 +20,9 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {FixedPointMathLib} from "solady/src/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "solady/src/utils/SafeTransferLib.sol";
 
 import {ISweepBurnRouter} from "./interfaces/ISweepBurnRouter.sol";
@@ -43,6 +46,15 @@ import {ISweepFactory} from "./interfaces/ISweepFactory.sol";
  * feeds itself, and that is by design rather than by accident.
  */
 contract SweepBurnRouter is ISweepBurnRouter, IUnlockCallback {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
+    /// @notice The share of the pool's live ETH reserve one protocol buy may spend, in basis points.
+    /// @dev The graduated pool is one full-range position nobody can add to, so its ETH side moves
+    /// with the square root of the price: a constant cap that is safe at graduation is
+    /// sandwichable once the price has fallen. A share of the live reserve keeps the burn's price
+    /// impact — the one thing a sandwich feeds on — the same at every price.
+    uint256 public constant MAX_BURN_DEPTH_BPS = 400;
     /// @dev The burn only ever buys, which lowers the price, so this is the only limit it needs.
     uint160 private constant MIN_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
 
@@ -95,6 +107,35 @@ contract SweepBurnRouter is ISweepBurnRouter, IUnlockCallback {
     }
 
     /**
+     * @notice The largest single buy of `token` a strategy may make on its own pool right now:
+     * `MAX_BURN_DEPTH_BPS` of the pool's ETH reserve.
+     *
+     * @dev The reserve of a full-range position is `L / sqrtP`, read live from the PoolManager;
+     * zero before the pool exists. Both a desk's burn pass and a recursive distribution are
+     * bounded by it. A front-run buy deepens the ETH side and raises the bound in step, but the
+     * ratio of the burn to the depth it lands in stays fixed, and the attacker pays the 10% fee
+     * on both legs of a position that grows with the depth.
+     */
+    function maxBurnBuy(address token) external view returns (uint256) {
+        PoolId id = _keyFor(token).toId();
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+        if (sqrtPriceX96 == 0) return 0;
+        uint256 depth = FixedPointMathLib.fullMulDiv(poolManager.getLiquidity(id), 1 << 96, sqrtPriceX96);
+        return (depth * MAX_BURN_DEPTH_BPS) / 10_000;
+    }
+
+    /// @notice The pool key every Sweep launch's pool carries.
+    function _keyFor(address token) private view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(token),
+            fee: LP_FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(factory.hook())
+        });
+    }
+
+    /**
      * @notice The swap, inside the PoolManager's flash-accounting window.
      *
      * @dev `NotPoolManager` is the guard that matters: this function settles ETH and takes tokens on
@@ -112,23 +153,17 @@ contract SweepBurnRouter is ISweepBurnRouter, IUnlockCallback {
      * finds liquidity until the supply itself is exhausted.
      *
      * @dev The tokens are taken to this contract and then transferred on, rather than taken to the
-     * recipient directly. The lock admits the dead address unconditionally, so a direct take would
-     * leave the hook's transient authorisation unspent and standing open for the rest of the
-     * transaction — and `processBurn` is public, so the rest of the transaction is whoever called
-     * it. Taking to self consumes the allowance exactly; the onward transfer is admitted on its own
-     * terms. One extra transfer, and the hook's invariant holds here too.
+     * recipient directly. When the lock still admitted the dead address before reading the pool
+     * rule, a direct take left the hook's transient authorisation unspent and standing open for
+     * the rest of the transaction — and `processBurn` is public, so the rest of the transaction is
+     * whoever called it. Taking to self consumes the allowance exactly; the onward transfer is admitted on its own
+     * terms. One extra transfer, and brick 4's invariant holds here too.
      */
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         (address token, address recipient, uint256 amountIn) = abi.decode(data, (address, address, uint256));
 
-        PoolKey memory key = PoolKey({
-            currency0: Currency.wrap(address(0)),
-            currency1: Currency.wrap(token),
-            fee: LP_FEE,
-            tickSpacing: TICK_SPACING,
-            hooks: IHooks(factory.hook())
-        });
+        PoolKey memory key = _keyFor(token);
 
         BalanceDelta delta = poolManager.swap(
             key,

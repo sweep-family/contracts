@@ -9,7 +9,7 @@ import {ERC20} from "solady/src/tokens/ERC20.sol";
  * @notice A plain mintable ERC-20 standing in for a strategy token in the curve's unit tests.
  *
  * @dev No transfer lock: the lock's interaction with the curve (distributor status at init) is
- * the token's property and is pinned in `StrategyBase.t.sol` against the real `SweepToken`. Here the token only has
+ * brick 12's property and is pinned there against the real `SweepToken`. Here the token only has
  * to move, answer `hook()`, and record `markGraduated` so the tests can assert who called it and
  * how often.
  */

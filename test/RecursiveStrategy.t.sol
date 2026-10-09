@@ -38,6 +38,7 @@ contract RecursiveStrategyTest is Test {
 
     uint256 internal constant RATE = 1000;
     uint256 internal constant ROUTER_INVENTORY = 100_000_000e18;
+    uint256 internal distributeCooldown;
 
     function setUp() public {
         vm.warp(1_788_000_000);
@@ -55,6 +56,7 @@ contract RecursiveStrategyTest is Test {
         MockStrategyHook(payable(hook)).poolLeg(address(strategy), pool, address(this), poolManager, pooled);
 
         vm.deal(hook, 100 ether);
+        distributeCooldown = strategy.DISTRIBUTE_COOLDOWN();
     }
 
     /* ───────────────────────── initialisation ──────────────────────── */
@@ -105,7 +107,7 @@ contract RecursiveStrategyTest is Test {
         _buy(bob, 100e18);
         _fund(1 ether);
 
-        strategy.distribute();
+        _distribute();
 
         uint256 bought = 1 ether * RATE;
         assertEq(strategy.balanceOf(address(strategy)), bought);
@@ -122,7 +124,7 @@ contract RecursiveStrategyTest is Test {
         _fund(1 ether);
         vm.expectEmit(false, false, false, true, address(strategy));
         emit SweepRecursiveStrategy.RewardsDistributed(1 ether, 1 ether * RATE, 200e18);
-        strategy.distribute();
+        _distribute();
     }
 
     /// @notice A wallet that buys after a distribution has no share of it, and a wallet that sold
@@ -132,7 +134,7 @@ contract RecursiveStrategyTest is Test {
         _buy(bob, 100e18);
         _sell(bob, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         _buy(carol, 100e18);
 
         assertEq(strategy.claimable(alice), 1 ether * RATE);
@@ -144,7 +146,7 @@ contract RecursiveStrategyTest is Test {
     function test_SellingAfterADistributionKeepsWhatWasOwed() public {
         _buy(alice, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         _sell(alice, 100e18);
 
         assertEq(strategy.claimable(alice), 1 ether * RATE);
@@ -154,7 +156,7 @@ contract RecursiveStrategyTest is Test {
     function test_ExcludedAccountsNeverAccrueAndCannotClaim() public {
         _buy(alice, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
 
         assertEq(strategy.claimable(poolManager), 0);
         assertEq(strategy.claimable(address(router)), 0);
@@ -169,24 +171,51 @@ contract RecursiveStrategyTest is Test {
         _buy(alice, 100e18);
         _fund(0.0009 ether);
         vm.expectRevert(SweepRecursiveStrategy.NothingToDistribute.selector);
-        strategy.distribute();
+        _distribute();
 
         vm.expectRevert(SweepRecursiveStrategy.NothingToDistribute.selector);
         SweepRecursiveStrategy(payable(address(strategy))).distribute();
+    }
+
+    /// @notice LR-6: the minimum gates what is pending, not what the depth bound lets one pass
+    /// spend. With the owner's largest minimum and a pool shallow enough to bound each pass below
+    /// it, the queue still drains one bounded pass at a time instead of stopping for good.
+    function test_AMinimumAboveTheDepthBoundDoesNotStopDistributions() public {
+        _buy(alice, 100e18);
+        uint256 minimum = strategy.MAX_REWARD_MIN();
+        vm.prank(owner);
+        strategy.setRewardMin(minimum);
+        _fund(minimum * 2);
+        router.setDepthBound(0.17 ether);
+
+        _distribute();
+
+        assertEq(strategy.pendingRewards(), minimum * 2 - 0.17 ether, "one bounded pass was spent");
+    }
+
+    /// @notice The minimum still holds back a queue that has not reached it.
+    function test_AQueueBelowTheMinimumStillWaits() public {
+        _buy(alice, 100e18);
+        vm.prank(owner);
+        strategy.setRewardMin(0.5 ether);
+        _fund(0.4 ether);
+
+        vm.expectRevert(SweepRecursiveStrategy.NothingToDistribute.selector);
+        _distribute();
     }
 
     /// @notice Fees that arrive before anyone holds the token are carried, and the first holder
     /// receives them with the next distribution rather than losing them to nobody.
     function test_FeesBeforeTheFirstHolderAreCarried() public {
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         assertEq(strategy.carry(), 1 ether * RATE);
         assertEq(strategy.reserved(), 0);
         assertEq(strategy.claimable(alice), 0);
 
         _buy(alice, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         assertEq(strategy.carry(), 0);
         assertEq(strategy.claimable(alice), 2 ether * RATE);
     }
@@ -197,7 +226,7 @@ contract RecursiveStrategyTest is Test {
         _buy(alice, 200e18);
         _buy(bob, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         uint256 owedAlice = strategy.claimable(alice);
         uint256 owedBob = strategy.claimable(bob);
 
@@ -219,7 +248,7 @@ contract RecursiveStrategyTest is Test {
     function test_ClaimEmitsPerHolder() public {
         _buy(alice, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         vm.expectEmit(true, false, false, true, address(strategy));
         emit SweepRecursiveStrategy.RewardClaimed(alice, 1 ether * RATE);
         vm.prank(alice);
@@ -232,7 +261,7 @@ contract RecursiveStrategyTest is Test {
         _buy(alice, 1_000_000e18);
         _buy(bob, 1);
         _fund(0.001 ether);
-        strategy.distribute();
+        _distribute();
         assertLt(strategy.claimable(bob), strategy.REWARD_DUST());
 
         address[] memory holders = new address[](2);
@@ -250,12 +279,12 @@ contract RecursiveStrategyTest is Test {
         _buy(alice, 100e18);
         _buy(bob, 100e18);
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
         vm.prank(alice);
         strategy.claim();
 
         _fund(1 ether);
-        strategy.distribute();
+        _distribute();
 
         uint256 aliceBalance = 100e18 + 0.5 ether * RATE;
         uint256 eligible = aliceBalance + 100e18;
@@ -304,7 +333,7 @@ contract RecursiveStrategyTest is Test {
         assertEq(strategy.burnRouter(), address(next));
     }
 
-    /// @notice An unlisted router is refused by name: this setter would
+    /// @notice An unlisted router is refused by name (decision 0015): this setter would
     /// otherwise send every pending distribution to an arbitrary address.
     function test_SetBurnRouterRefusesAnUnlistedRouter() public {
         MockBurnRouter rogue = new MockBurnRouter();
@@ -341,7 +370,7 @@ contract RecursiveStrategyTest is Test {
         uint256 claimed;
         for (uint256 i = 0; i < rounds; i++) {
             _fund(feeWei);
-            strategy.distribute();
+            _distribute();
             bought += feeWei * RATE;
             if (i % 2 == 0) {
                 uint256 before = strategy.balanceOf(alice);
@@ -383,6 +412,14 @@ contract RecursiveStrategyTest is Test {
         vm.prank(holder);
         strategy.approve(poolManager, amount);
         MockStrategyHook(payable(hook)).poolLeg(address(strategy), pool, holder, poolManager, amount);
+    }
+
+    /// @dev Distributions are paced on-chain, so each one in a test steps past the cooldown first,
+    /// as a keeper running on the hour always has. The cooldown is read once in `setUp`: reading
+    /// it here would be the external call a preceding `vm.expectRevert` consumes.
+    function _distribute() private {
+        vm.warp(block.timestamp + distributeCooldown);
+        strategy.distribute();
     }
 
     function _fund(uint256 amount) private {

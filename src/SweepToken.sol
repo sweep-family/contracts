@@ -51,7 +51,7 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
     /// @notice The only address allowed to fund the strategy or authorise a pool transfer.
     address public hook;
 
-    /// @notice The bonding curve this token launched on. Written once at
+    /// @notice The bonding curve this token launched on (decision 0013). Written once at
     /// initialisation and never after; it is the one address besides the distributors and the
     /// PoolManager the transfer lock lets tokens move through, which is what confines all
     /// pre-graduation trading to the curve.
@@ -69,7 +69,7 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
     error OnlyCurve();
     error TransferNotAllowed();
     error InvalidConfiguration();
-    error CurveDistributorFixed();
+    error DistributorEntryFixed();
 
     event DistributorUpdated(address indexed account, bool allowed);
     event TransferAllowanceIncreased(uint256 amount);
@@ -86,7 +86,7 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
 
     /// @dev The implementation behind the clones must not be initialisable by a stranger, who would
     /// otherwise own a contract — and a billion tokens — at the very address the deployment record
-    /// names. Clones never run a constructor, so every
+    /// names (finding 8 of the 22 September review). Clones never run a constructor, so every
     /// launch initialises as before.
     constructor() {
         _disableInitializers();
@@ -95,7 +95,7 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
     /**
      * @notice Wires the token and mints its entire supply to the caller.
      * @dev The caller is the factory, which moves the whole supply onto the launch's bonding
-     * curve in the same transaction. A zero hook could never open an
+     * curve in the same transaction (decision 0013). A zero hook could never open an
      * allowance, a zero pool manager would make the lock's pool rule unreachable, and a zero owner
      * would leave every setter dead; all three are refused rather than deployed broken.
      */
@@ -185,13 +185,17 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
     /// @notice Exempts an address from the transfer lock, or removes it.
     /// @dev Restricted to the owner, and worth naming for what it grants: everything on this list
     /// trades without paying the fee, which is the only reason a competing hookless pool cannot
-    /// exist. The power is kept because the router needs it, and it is named here for that reason.
-    /// @dev `CurveDistributorFixed` keeps the curve's entry out of the owner's reach, both ways.
-    /// Without it, delisting the curve would freeze every buy, every sell and the graduation, with
-    /// the buyers' ETH held on the curve at the owner's pleasure — an owner power over curve
-    /// reserves that the design says does not exist. Initialisation is the entry's only writer.
+    /// exist. The reference marks this `onlyOwner` while its own NatSpec claims `onlyFactory`; we
+    /// keep the power because the router needs it, and say so.
+    /// @dev `DistributorEntryFixed` keeps two entries out of the owner's reach, both ways. The
+    /// curve's: delisting it froze every buy, every sell and the graduation, with the buyers' ETH
+    /// held on the curve at the owner's pleasure (audit 2026-10-02, M-1) — an owner power over
+    /// curve reserves that decision 0014 says does not exist. And the token's own: a recursive
+    /// strategy pays its airdrops out of its own balance as a distributor, and delisting it froze
+    /// every claim and every distribution with the holders' reserved tokens inside (review of the
+    /// fixes, 2026-10-02). Initialisation is the only writer of either.
     function setDistributor(address account, bool allowed) external onlyOwner {
-        if (account == curve) revert CurveDistributorFixed();
+        if (account == curve || account == address(this)) revert DistributorEntryFixed();
         isDistributor[account] = allowed;
         emit DistributorUpdated(account, allowed);
     }
@@ -213,28 +217,29 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
      *
      * @dev The other half is the hook's `RouterNotAllowed`, and this lock is not sufficient on its
      * own: it sees ERC-20 movements only, while v4 also keeps ERC-6909 claim balances that move
-     * between wallets through the PoolManager without touching this function at all, and a
-     * swapper holding such claims can fund a hookless pool and trade there for free. The hook
-     * closes that gap by refusing any swap whose caller is not a router the factory lists, so no
-     * claim on this token can be minted in the first place.
+     * between wallets through the PoolManager without touching this function at all. The
+     * pre-mainnet review of 22 September 2026 walked a live escape through exactly that gap.
+     * Decision 0010 closes it by refusing any swap whose caller is not a router the factory lists,
+     * so no claim on this token can be minted in the first place.
      *
      * @dev Sends to the dead address are always allowed: destroying your own balance can never be
      * a way around a fee, and refusing it would only make voluntary burns impossible.
      *
-     * @dev The PoolManager rule is read before the distributor exemption, and the order is the
-     * guard. A leg into or out of the PoolManager is how a balance becomes an ERC-6909 claim, so
-     * it must spend the hook's allowance whoever sends it — a distributor included. Read the
-     * other way round, the curve, a distributor, could deliver a buy straight into the
-     * PoolManager inside an unlock and have it minted as claims that moved wallet to wallet and
-     * funded a hookless pool. Every legitimate distributor leg through the PoolManager happens
-     * inside a hooked swap or the graduation mint, which grant it.
+     * @dev The PoolManager rule is read before the dead-address and distributor exemptions, and
+     * the order is the guard. A leg into or out of the PoolManager is how a balance becomes an
+     * ERC-6909 claim, so it must spend the hook's allowance whoever sends it — a distributor
+     * included. Read the other way round, the curve, a distributor, could deliver a buy straight
+     * into the PoolManager inside an unlock and have it minted as claims that moved wallet to
+     * wallet and funded a hookless pool (audit 2026-10-02, H-1). Every legitimate distributor leg
+     * through the PoolManager happens inside a hooked swap or the graduation mint, which grant
+     * it. The dead address follows the same rule: a PoolManager leg straight to it would
+     * otherwise pass free and leave the hook's grant unspent for the rest of the transaction.
      *
      * @dev Virtual so a strategy that keeps a ledger over balances can settle it before a balance
      * moves; an override must still call this, since the lock is the whole point.
      */
     function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual override {
         if (from == address(0)) return;
-        if (to == DEAD_ADDRESS) return;
 
         if (from == poolManager || to == poolManager) {
             uint256 allowed = _transferAllowance();
@@ -246,6 +251,7 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
             return;
         }
 
+        if (to == DEAD_ADDRESS) return;
         if (isDistributor[from] || isDistributor[to]) return;
 
         revert TransferNotAllowed();

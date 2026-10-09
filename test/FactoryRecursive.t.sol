@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {VmSafe} from "forge-std/Vm.sol";
 import {Ownable} from "solady/src/auth/Ownable.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -21,6 +22,8 @@ import {SweepBurnRouter} from "../src/SweepBurnRouter.sol";
 import {SweepSwapRouter} from "../src/SweepSwapRouter.sol";
 import {ISweepFactory} from "../src/interfaces/ISweepFactory.sol";
 import {SweepForkTest} from "./shared/SweepForkTest.sol";
+import {SweepBondingCurve} from "../src/SweepBondingCurve.sol";
+import {GasBurningLauncher, IRecursiveLaunch} from "./mocks/CurveTestActors.sol";
 
 /**
  * @title FactoryRecursiveTest
@@ -101,7 +104,9 @@ contract FactoryRecursiveTest is SweepForkTest {
             address(manager),
             factory.strategyImplementation(),
             feeTo,
-            address(this)
+            address(this),
+            PHANTOM_QUOTE,
+            GRADUATION_THRESHOLD
         );
         bytes memory args = abi.encode(manager, ISweepFactory(address(fresh)), feeTo);
         (address mined, bytes32 salt) = HookMiner.find(CREATE2_DEPLOYER, HOOK_FLAGS, type(SweepHook).creationCode, args);
@@ -163,8 +168,8 @@ contract FactoryRecursiveTest is SweepForkTest {
     }
 
     /// @notice The launcher fixed at launch is the recipient for good, here as everywhere else.
-    /// No kind of strategy has a collection owner who could re-point the share, and the hook
-    /// exposes no call that would do it.
+    /// This kind never had a collection whose owner could re-point the share; since decision 0009
+    /// neither do the other two, and the call that would have done it is gone from the hook.
     function test_TheCreatorRecipientCannotBeRepointed() public {
         address strategy = _launchRecursive();
 
@@ -174,6 +179,58 @@ contract FactoryRecursiveTest is SweepForkTest {
 
         assertFalse(ok, "the removed claim is still callable");
         assertEq(hook.creatorFeeRecipient(strategy), trader, "the recipient moved");
+    }
+
+    /// @notice A launcher that burns every drop of gas it is paid with — anyone can deploy one and
+    /// launch, since recursive launches are ungated — cannot make the crossing buy leave the
+    /// launch ungraduated at the gas a wallet actually sends, cannot block the seed, and is still
+    /// paid its creator share in full when the fees are swept afterwards.
+    ///
+    /// @dev The e2e mainnet-fork finding of 2026-10-05, on the real token: graduation used to pay
+    /// the fee recipients by force, and the force-send burnt its whole 100k stipend inside the
+    /// 63/64 share the auto-graduation self-call gets, so the crossing buy sent at the wallet's
+    /// own estimate (257,603) landed with `AutoGraduationFailed`. The call gas below is that
+    /// transaction limit less the intrinsic 21,000 and a 1,000 allowance for calldata. The seed
+    /// must still be exactly the real reserve: the curve keeps the owed fees and nothing else.
+    ///
+    /// @dev The gas cap only means something on the optimized bytecode that ships. `forge
+    /// coverage` compiles with `--ir-minimum` and no optimizer, where the same buy costs more, so
+    /// under coverage the buy is sent uncapped and the test still walks the graduation, the seed
+    /// and the sweep. `forge test` keeps the cap, which is the property this test pins.
+    function test_AGasBurningLauncherCannotStarveGraduationAndIsStillPaid() public {
+        GasBurningLauncher burner = new GasBurningLauncher();
+        address strategy = burner.launch{value: LAUNCH_FEE}(IRecursiveLaunch(address(factory)));
+        SweepBondingCurve curve = SweepBondingCurve(payable(factory.curveOf(strategy)));
+        assertEq(curve.creatorFeeRecipient(), address(burner));
+
+        vm.warp(block.timestamp + 5);
+        vm.prank(whale);
+        curve.buy{value: 20 ether, gas: _crossingBuyGas()}(0, whale);
+        assertTrue(curve.graduated(), "the crossing buy left graduation failed");
+
+        uint256 protocolOwed = curve.protocolFeeBalance();
+        uint256 creatorOwed = curve.creatorFeeBalance();
+        uint256 realReserve = curve.realQuoteReserve();
+        assertApproxEqAbs(realReserve, GRADUATION_THRESHOLD, 1e3);
+        assertEq(address(curve).balance, realReserve + protocolOwed + creatorOwed);
+
+        factory.createGraduatedPool(strategy);
+        assertTrue(factory.positionIdOf(strategy) != 0, "the graduation did not settle");
+        assertEq(address(curve).balance, protocolOwed + creatorOwed, "the seed was not exactly the real reserve");
+        assertEq(address(factory).balance, 0, "ETH stranded in the factory");
+
+        uint256 protocolBefore = feeTo.balance;
+        curve.sweepFees();
+        assertEq(address(burner).balance, creatorOwed, "the creator was not paid in full");
+        assertEq(feeTo.balance - protocolBefore, protocolOwed, "the protocol was not paid in full");
+        assertEq(address(curve).balance, 0, "ETH stranded on the curve");
+    }
+
+    /// @notice The call gas a wallet sends with the crossing buy: its own estimate of 257,603
+    /// less the intrinsic 21,000 and a 1,000 allowance for calldata. Under `forge coverage`,
+    /// whose unoptimized bytecode costs more, it is all the gas left (see the test above).
+    function _crossingBuyGas() private view returns (uint256) {
+        return vm.isContext(VmSafe.ForgeContext.Coverage) ? gasleft() : 257_603 - 21_000 - 1000;
     }
 
     /* ─────────────────────────── the routers ────────────────────────── */

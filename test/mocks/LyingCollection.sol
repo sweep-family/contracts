@@ -6,9 +6,10 @@ pragma solidity ^0.8.26;
  * @author 0xDAVZER
  * @notice An ERC-721 whose `transferFrom` quietly does nothing and returns as if it worked.
  *
- * @dev Non-conforming, and they exist. A desk that clears its listing *before* transferring and
- * ignores the result is broken by exactly this shape: a buyer's ETH is taken, the piece stays put,
- * and the listing is destroyed — all in one transaction, with nothing reverting.
+ * @dev Non-conforming, and they exist. This is the exact shape that breaks the reference: it clears
+ * its listing *before* transferring and ignores the result, so against a collection like this one a
+ * buyer's ETH is taken, the piece stays put, and the listing is destroyed — all in one transaction,
+ * with nothing reverting.
  *
  * Our desk transfers first and asserts ownership afterwards, so this contract makes that assertion
  * fire instead of being taken on trust.

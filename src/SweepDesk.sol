@@ -12,6 +12,8 @@ pragma solidity ^0.8.26;
     sweeping the floor, one cycle at a time
 */
 
+import {SafeTransferLib} from "solady/src/utils/SafeTransferLib.sol";
+
 import {ISweepFactory, ISweepHooked} from "./interfaces/ISweepFactory.sol";
 import {SweepStrategy} from "./SweepStrategy.sol";
 import {ISweepBurnRouter} from "./interfaces/ISweepBurnRouter.sol";
@@ -41,17 +43,19 @@ abstract contract SweepDesk is SweepStrategy {
 
     /// @notice Seconds over which the ask falls from its markup back to what was paid.
     ///
-    /// @dev **Zero by default.** A fixed ask is what ships. The decay is retained as a lever, off
-    /// unless deliberately switched on.
+    /// @dev **Three days at launch since 6 October 2026, decision 0020**, which supersedes
+    /// decision 0004's fixed ask. The factory sets it from its own `askDecayWindow`.
     ///
-    /// The cost of a fixed ask is real and known: when the floor falls below the ask, the piece
-    /// becomes unsellable and the burn stops with it. Inventory accumulates, and nothing reaches
-    /// the burn.
+    /// The cost of a fixed ask stopped being theoretical: when the floor falls below the ask, the
+    /// piece becomes unsellable and the burn stops with it. Read live on ChimpStrategy — 355
+    /// pieces held, about 9% of its collection, nothing pending burn — and then on our own mainnet
+    /// fork, where the Hoodborn desk bought 54 floor pieces in 35 minutes that a 1.2x ask would
+    /// never resell, with every purchase walking a longer shelf.
     ///
-    /// The cost of a decaying ask is subtler and is why it stays off. The protocol buys below floor,
-    /// so an ask decaying toward what it paid ends up **under** the floor — and the protocol becomes
-    /// a competitor to the collection's own sellers, who are exactly the people it needs on side.
-    /// Unsold inventory is a slower failure than antagonising the collection.
+    /// The cost of a decaying ask is the one decision 0004 weighed: the protocol buys below floor,
+    /// so an ask decaying toward what it paid can end up **under** the floor, competing with the
+    /// collection's own sellers. Three days keeps the markup standing through most of a market
+    /// cycle before it gives way. Zero still means a fixed ask, for a desk whose owner judges so.
     uint256 public askDecayWindow;
 
     error NotForSale();
@@ -81,13 +85,14 @@ abstract contract SweepDesk is SweepStrategy {
      * markup and falls back toward what the protocol paid, and it never goes below that — so a sale
      * is never a realised loss, only a smaller gain.
      *
-     * @dev A resale priced once, at purchase, and never moved becomes unsellable the moment the
-     * floor falls below it. A fixed ask above a falling floor strands the inventory: the machine
-     * keeps buying and stops selling, and every burn stops with it. The decay is the lever that
-     * lets the ask follow the market down.
+     * @dev This is the fix for the reference's worst failure. It prices a resale once, at purchase,
+     * and never moves it; when the floor falls below that number the piece becomes unsellable
+     * forever, with no function to lower it. Observed live on ChimpStrategy: 355 pieces held, about
+     * 9% of the whole collection, with nothing pending burn — the machine kept buying and stopped
+     * selling, so the burn stopped entirely.
      *
-     * @dev A zero window disables the decay entirely, and that is what ships. See `askDecayWindow`
-     * for why the lever exists but stays off. A holding with no cost is not held, and asks zero.
+     * @dev A zero window disables the decay entirely; the factory launches with three days. See
+     * `askDecayWindow` for why. A holding with no cost is not held, and asks zero.
      */
     function _askFor(Holding memory holding) internal view returns (uint256) {
         if (holding.cost == 0) return 0;
@@ -99,6 +104,25 @@ abstract contract SweepDesk is SweepStrategy {
         if (elapsed >= askDecayWindow) return holding.cost;
 
         return holding.cost + ((peak - holding.cost) * (askDecayWindow - elapsed)) / askDecayWindow;
+    }
+
+    /**
+     * @dev Refuses a sale paid below `ask`. Paid above is accepted: the ask descends every second,
+     * so the amount a buyer read covers the ask in force when the sale lands, and the excess goes
+     * back through `_refundExcess`. Demanding the exact ask refused every sale a wallet took more
+     * than a second to sign, which was every sale made from the site (7 Oct 2026, mainnet preprod).
+     */
+    function _requireAsk(uint256 ask) internal view {
+        if (msg.value < ask) revert WrongPayment();
+    }
+
+    /**
+     * @dev Returns what a buyer sent above `ask`. Called last, after the sale is booked, so a buyer
+     * that refuses ETH reverts its own purchase rather than leaving the excess with the desk; the
+     * caller is `nonReentrant`, so the call cannot reach back into the desk.
+     */
+    function _refundExcess(uint256 ask) internal {
+        if (msg.value > ask) SafeTransferLib.safeTransferETH(msg.sender, msg.value - ask);
     }
 
     /// @notice Retunes the resale terms for holdings bought from here on.
@@ -114,9 +138,9 @@ abstract contract SweepDesk is SweepStrategy {
 
     /// @notice Points the burn at a different router, which must be one the factory lists.
     /// @dev Exists because a router is the kind of dependency that gets redeployed. The factory
-    /// gate is there because without it this setter is a drain — point the burn at a contract
+    /// gate is decision 0015: without it this setter is a drain — point the burn at a contract
     /// that keeps the ETH and every queued sale proceeds is gone. Reached through the hook's
-    /// immutable factory address, so there is nothing here the owner can repoint first; the
+    /// immutable factory reference, so there is nothing here the owner can repoint first; the
     /// zero address is never listed, so the old zero check is subsumed rather than dropped.
     function setBurnRouter(address router) external onlyOwner {
         if (!ISweepFactory(ISweepHooked(hook).factory()).isRouter(router)) revert RouterNotListed();
@@ -125,6 +149,11 @@ abstract contract SweepDesk is SweepStrategy {
     }
 
     /// @dev Buys this token on its own pool and sends it straight to the dead address.
+    /// @notice The burn router's live bound: a fixed share of the pool's ETH reserve.
+    function _burnBound() internal view override returns (uint256) {
+        return ISweepBurnRouter(burnRouter).maxBurnBuy(address(this));
+    }
+
     function _executeBurn(uint256 amountIn) internal override {
         ISweepBurnRouter(burnRouter).buyTokenWithEth{value: amountIn}(address(this), DEAD_ADDRESS);
     }

@@ -9,7 +9,7 @@ pragma solidity ^0.8.26;
  * @dev The factory and the hook cannot both be constructed first: the factory needs the hook's
  * address to build the `PoolKey`, and the hook needs the factory's to ask whether a launch is in
  * progress. Naming the dependency here rather than importing the factory is what lets the hook be
- * proven against a mock before the factory exists — the same reason `ISweepBurnRouter` exists.
+ * proven against a mock before brick 5 exists — the same reason `ISweepBurnRouter` exists.
  */
 interface ISweepFactory {
     /**
@@ -45,6 +45,12 @@ interface ISweepFactory {
     /// token from ever existing — see the hook's `_afterSwap`. It is a list of contracts we wrote,
     /// not a permission a trader holds: anyone may trade, through one of them.
     function isRouter(address router) external view returns (bool);
+
+    /// @notice Whether `manager` may move a desk's bid within the desk's restorable highs.
+    /// @dev Read by every desk this factory launched, through its hook, on `manageBid`. A listed
+    /// manager can never raise a desk's restorable highs, so what this grants is bounded by what
+    /// each desk's owner already put in force (decision 0019).
+    function isBidManager(address manager) external view returns (bool);
 }
 
 /**

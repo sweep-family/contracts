@@ -60,7 +60,7 @@ contract SwapRouterTest is SweepForkTest {
     }
 
     /// @notice A buy refunds the caller's own unspent ETH and nothing else.
-    /// @dev The refund used to be
+    /// @dev Finding 10 of the 22 September review, closed on 2026-10-02. The refund used to be
     /// the router's whole balance, so ETH force-sent to the router — by `selfdestruct`, which no
     /// `receive` can refuse — went to whoever bought next, a race only a bot wins.
     function test_BuyRefundsOnlyTheCallersOwnChange() public {
@@ -109,7 +109,7 @@ contract SwapRouterTest is SweepForkTest {
         assertTrue(found, "no Trade event");
     }
 
-    /// @notice The hook's invariant on the sell side: the tokens go wallet to PoolManager, exactly
+    /// @notice Brick 4's invariant on the sell side: the tokens go wallet to PoolManager, exactly
     /// what the hook authorised, and nothing stands open afterwards.
     function test_SellLeavesNoTransferAllowanceBehind() public {
         SellProbe probe = new SellProbe();

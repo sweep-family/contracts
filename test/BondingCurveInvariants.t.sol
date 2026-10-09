@@ -106,7 +106,7 @@ contract BondingCurveInvariantsTest is Test {
         vm.warp(1_788_000_000);
         MockFeeHook feeHook = new MockFeeHook(protocolRecipient);
         token = new CurveTestToken(address(feeHook));
-        address implementation = address(new SweepBondingCurve());
+        address implementation = address(new SweepBondingCurve(1.68 ether, 4.2 ether));
         curve = SweepBondingCurve(payable(LibClone.deployERC1967(implementation)));
         token.mint(address(curve), SUPPLY);
         curve.initialize(address(token), creator, launcher);

@@ -169,7 +169,7 @@ contract ERC20StrategyTest is Test {
     /**
      * @notice With nothing to spend, the desk refuses rather than buying for free.
      * @dev A bag bought for zero would be listed at zero, and a zero ask is how "not held" is
-     * spelled — the bag would be stuck forever.
+     * spelled — the bag would be stuck forever. The reference calls this `NoZeroBuys`.
      */
     function test_PurchaseRefusesWhenTheBidIsZero() public {
         vm.prank(seller);
@@ -281,17 +281,34 @@ contract ERC20StrategyTest is Test {
         assertEq(strategy.askPrice(bagId), 0);
     }
 
-    /// @notice The price is exact in both directions: the desk quotes, the buyer does not.
-    function test_SaleDemandsTheExactAsk() public {
+    /// @notice Less than the ask is refused: the desk quotes, the buyer does not.
+    function test_SaleRefusesLessThanTheAsk() public {
         uint256 bagId = _fundAndBuy(5 ether);
         uint256 ask = strategy.askPrice(bagId);
 
-        vm.startPrank(buyer);
+        vm.prank(buyer);
         vm.expectRevert(SweepDesk.WrongPayment.selector);
         strategy.sellTokens{value: ask - 1}(bagId);
-        vm.expectRevert(SweepDesk.WrongPayment.selector);
-        strategy.sellTokens{value: ask + 1}(bagId);
-        vm.stopPrank();
+    }
+
+    /// @notice The ask a buyer read has descended by the time the sale lands: the sale fills at
+    /// the ask in force, refunds the difference, and queues only that ask for burning.
+    function test_SaleAtAStaleAskFillsAtTheCurrentAskAndRefundsTheRest() public {
+        uint256 bagId = _fundAndBuy(5 ether);
+        vm.prank(owner);
+        strategy.setResaleTerms(MULTIPLIER, 30 days);
+        uint256 quoted = strategy.askPrice(bagId);
+        vm.warp(block.timestamp + 1 hours);
+        uint256 current = strategy.askPrice(bagId);
+        assertLt(current, quoted, "the ask did not descend");
+        uint256 before = buyer.balance;
+
+        vm.prank(buyer);
+        strategy.sellTokens{value: quoted}(bagId);
+
+        assertEq(target.balanceOf(buyer), BAG);
+        assertEq(buyer.balance, before - current, "the buyer paid more than the ask in force");
+        assertEq(strategy.pendingBurn(), current, "the queue took the overpayment");
     }
 
     function test_SaleOfAnUnknownBagIsRefused() public {
@@ -312,8 +329,8 @@ contract ERC20StrategyTest is Test {
 
     /**
      * @notice A token that returns false from `transfer` cannot take the buyer's ETH.
-     * @dev A desk that deletes the listing and calls `transfer` unchecked would, against this token,
-     * keep the ETH, keep the bag, and destroy the listing in one transaction.
+     * @dev The reference deletes the listing and calls `transfer` unchecked, so against this token
+     * it keeps the ETH, keeps the bag, and destroys the listing in one transaction.
      */
     function test_SaleRevertsWhenTheTokenLiesAboutTransferring() public {
         LyingToken liar = new LyingToken();
@@ -427,6 +444,22 @@ contract ERC20StrategyTest is Test {
         assertEq(target.balanceOf(address(strategy)), 0);
     }
 
+    /// @notice A pass the pool's depth bound rounds to zero is refused, and the cooldown is not
+    /// consumed: a pass that burns nothing must not block the next one.
+    function test_BurnRefusesAPassTheDepthBoundRoundsToZero() public {
+        uint256 bagId = _fundAndBuy(5 ether);
+        vm.prank(buyer);
+        strategy.sellTokens{value: 1.4 ether}(bagId);
+        router.setDepthBound(0);
+        uint256 lastBurnBefore = strategy.lastBurnAt();
+
+        vm.expectRevert(SweepStrategy.NothingToBurn.selector);
+        strategy.processBurn();
+
+        assertEq(strategy.pendingBurn(), 1.4 ether);
+        assertEq(strategy.lastBurnAt(), lastBurnBefore);
+    }
+
     /* ───────────────────────── conservation ─────────────────────────── */
 
     /**
@@ -460,13 +493,13 @@ contract ERC20StrategyTest is Test {
         assertEq(target.balanceOf(address(strategy)), strategy.bagsHeld() * BAG);
     }
 
-    /* the closing balance assertion */
+    /* the closing balance assertion (decision 0015) */
 
     /**
      * @notice A seller whose payment hook lifts the desk's held bags through the target token's
      * pre-approved operator passes the per-purchase delta check — it measures one transferFrom,
      * not the shelf — and is caught only by the closing assertion that the balance still covers
-     * every held bag. This is the DN404 / conduit shape of the attack.
+     * every held bag. The DN404 / conduit shape of the 2026-09 review's point 12.
      */
     function test_ASellerWhosePaymentHookDrainsTheShelfIsRefused() public {
         OperatorBagToken obag = new OperatorBagToken();

@@ -40,7 +40,8 @@ contract FactoryERC20Test is SweepForkTest {
 
     /* ─────────────────────────── the gate ───────────────────────────── */
 
-    /// @notice Anyone may launch on any token, for the fee.
+    /// @notice Anyone may launch on any token, for the fee. This is what the reference's live
+    /// factory does, checked by simulation on 2026-09-10, whatever its docs say.
     function test_AnyoneLaunchesForTheFee() public {
         vm.prank(trader);
         address strategy =
@@ -52,8 +53,8 @@ contract FactoryERC20Test is SweepForkTest {
         assertEq(address(SweepERC20Strategy(payable(strategy)).token()), address(target));
     }
 
-    /// @notice A token may carry as many bag desks as anyone cares to launch, same as a collection.
-    /// Each sizes its own bag from the same supply and buys from the same
+    /// @notice A token may carry as many bag desks as anyone cares to launch, same as a collection
+    /// since decision 0011. Each sizes its own bag from the same supply and buys from the same
     /// market, and they compete there exactly as two NFT desks do on a floor.
     function test_ATokenMayCarryManyBagDesks() public {
         address first = _launchERC20();
@@ -76,10 +77,11 @@ contract FactoryERC20Test is SweepForkTest {
     /// @notice A strategy pointed at something that is not a token could never buy a bag, and the
     /// fee would already be gone: an EOA, a collection, a contract with no supply, an empty token.
     ///
-    /// @dev The collection is minted into first, which is the whole point: an empty
-    /// `SweepTestCollection` answers `totalSupply() == 0` and would be refused for having no supply,
-    /// not for being a collection. Every `ERC721Enumerable` and every ERC721A answers
-    /// `totalSupply()` once it has pieces — the squat below.
+    /// @dev The collection is minted into first, which is the whole point. This test passed before
+    /// the review of 22 September 2026 while proving nothing: an empty `SweepTestCollection`
+    /// answers `totalSupply() == 0` and was refused for having no supply, not for being a
+    /// collection. Every `ERC721Enumerable` and every ERC721A answers `totalSupply()` once it has
+    /// pieces, which is finding 2 — the squat below.
     function test_LaunchRefusesWhatIsNotAnERC20() public {
         collection.mintBatch(launcher, 10);
         OwnerlessTargetToken empty = new OwnerlessTargetToken();
@@ -91,10 +93,13 @@ contract FactoryERC20Test is SweepForkTest {
         }
     }
 
-    /// @notice The fungible door refuses an ERC-721. A desk launched on one is dead on arrival,
-    /// because `transferFrom(address,address,uint256)` shares its selector with ERC-721, so a bag
-    /// of one piece can be bought and never resold. It is refused at the launch rather than at the
-    /// first purchase, when the fee is already spent.
+    /// @notice Finding 2 of the pre-mainnet review: the fungible door took an ERC-721. When the
+    /// review found it, that also took the collection's only slot and locked its owner out of
+    /// `launch` for good; decision 0011 has since removed the slot, so what is left is the other
+    /// half of the harm — the desk it produces is dead on arrival, because
+    /// `transferFrom(address,address,uint256)` shares its selector with ERC-721, so a bag of one
+    /// piece can be bought and never resold. It is refused at the launch rather than at the first
+    /// purchase, when the fee is already spent.
     function test_LaunchERC20RefusesACollection() public {
         collection.mintBatch(launcher, 500);
         collection.mintBatch(launcher, 500);
@@ -136,7 +141,9 @@ contract FactoryERC20Test is SweepForkTest {
             address(manager),
             factory.strategyImplementation(),
             feeTo,
-            address(this)
+            address(this),
+            PHANTOM_QUOTE,
+            GRADUATION_THRESHOLD
         );
         bytes memory args = abi.encode(manager, ISweepFactory(address(fresh)), feeTo);
         (address mined, bytes32 salt) = HookMiner.find(CREATE2_DEPLOYER, HOOK_FLAGS, type(SweepHook).creationCode, args);
@@ -144,6 +151,7 @@ contract FactoryERC20Test is SweepForkTest {
         require(ok, "hook deployment failed");
         fresh.setHook(mined);
         fresh.setBurnRouter(address(new SweepBurnRouter(manager, ISweepFactory(address(fresh)))));
+        fresh.setOpenLaunches(true);
 
         vm.prank(trader);
         vm.expectRevert(SweepNFTStrategyFactory.ERC20ImplementationNotSet.selector);
@@ -172,8 +180,8 @@ contract FactoryERC20Test is SweepForkTest {
 
     /* ─────────────────────────── the bag ────────────────────────────── */
 
-    /// @notice The bag is one thousandth of the supply, sized by the factory and not by a front end,
-    /// so no client can hand a launch a bag of its own choosing.
+    /// @notice The bag is one thousandth of the supply, sized by the factory and not by a front end:
+    /// the reference's form sent exactly this for a 296,296,296 supply.
     function test_TheBagIsOneThousandthOfTheSupply() public {
         address strategy = _launchERC20();
         assertEq(factory.BAG_DIVISOR(), 1000);
@@ -228,8 +236,8 @@ contract FactoryERC20Test is SweepForkTest {
 
     /* ───────────────────────── the owner path ───────────────────────── */
 
-    /// @notice The team-launched path: an explicit bag and an explicit recipient, for the factory
-    /// owner only, at the same fee.
+    /// @notice The reference's team-launched path: an explicit bag and an explicit recipient, for
+    /// the factory owner only, at the same fee.
     function test_TheFactoryOwnerMaySizeTheBagAndNameTheRecipient() public {
         vm.deal(address(this), 1 ether);
         address strategy = factory.ownerLaunchERC20{value: LAUNCH_FEE}(

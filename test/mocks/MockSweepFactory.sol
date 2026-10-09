@@ -21,6 +21,7 @@ contract MockSweepFactory is ISweepFactory {
     mapping(address strategy => address collection) public strategyToCollection;
     mapping(address token => bool launched) public isStrategy;
     mapping(address router => bool allowed) public isRouter;
+    mapping(address manager => bool allowed) public isBidManager;
 
     constructor(address owner_) {
         owner = owner_;
@@ -47,6 +48,11 @@ contract MockSweepFactory is ISweepFactory {
     /// forgets this watches every swap revert `RouterNotAllowed`, which is the gate working.
     function setRouter(address router, bool allowed) external {
         isRouter[router] = allowed;
+    }
+
+    /// @notice Lists or delists a bid manager, as `setBidManager` would.
+    function setBidManager(address manager, bool allowed) external {
+        isBidManager[manager] = allowed;
     }
 
     /// @notice Names the hook, as `setHook` would.

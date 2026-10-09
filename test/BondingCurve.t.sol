@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {LibClone} from "solady/src/utils/LibClone.sol";
 
 import {SweepBondingCurve} from "../src/SweepBondingCurve.sol";
@@ -18,14 +18,14 @@ import {
 /**
  * @title BondingCurveTest
  * @author 0xDAVZER
- * @notice Pins the launch market: pricing over a phantom reserve, the fee and
+ * @notice Pins the launch market of decision 0013: pricing over a phantom reserve, the fee and
  * snipe-tax legs, the clamped crossing buy, and a graduation that leaves nothing behind for
  * anyone to rescue.
  *
  * @dev The test contract plays the factory — it is `msg.sender` at initialize, so
  * `completeGraduation` pays out to it, which is why it carries a `receive`. The token is a plain
- * mintable ERC-20: the transfer lock's interaction with the curve is the token's property, pinned
- * in `StrategyBase.t.sol` against the real `SweepToken`.
+ * mintable ERC-20: the transfer lock's interaction with the curve is brick 12's property, pinned
+ * there against the real `SweepToken`.
  */
 contract BondingCurveTest is Test {
     uint256 internal constant SUPPLY = 1e27;
@@ -51,7 +51,7 @@ contract BondingCurveTest is Test {
     function setUp() public {
         vm.warp(START);
         feeHook = new MockFeeHook(protocolRecipient);
-        implementation = new SweepBondingCurve();
+        implementation = new SweepBondingCurve(PHANTOM, THRESHOLD);
         (curve, token) = _deployCurve(creator);
         vm.deal(alice, 100 ether);
         vm.deal(whale, 100 ether);
@@ -176,16 +176,52 @@ contract BondingCurveTest is Test {
         assertEq(alice.balance, 100 ether - 1 ether + expected);
     }
 
+    /// @notice The economics are fixed per implementation and scale together: a curve at a tenth
+    /// of the scale reserves the same 2/7 and graduates at its own threshold, refunding the rest.
+    function test_ATenthScaleCurveKeepsEveryRatio() public {
+        implementation = new SweepBondingCurve(PHANTOM / 10, THRESHOLD / 10);
+        (SweepBondingCurve small,) = _deployCurve(creator);
+        assertEq(small.PHANTOM_QUOTE(), PHANTOM / 10);
+        assertEq(small.reservedTokens(), RESERVED);
+
+        vm.warp(START + 5);
+        uint256 before = whale.balance;
+        vm.prank(whale);
+        small.buy{value: 1 ether}(0, whale);
+        assertTrue(small.graduated());
+        assertGe(small.trackedQuote(), THRESHOLD / 10);
+        assertLt(before - whale.balance, 0.45 ether, "the crossing buy was not clamped to the smaller threshold");
+    }
+
+    /// @notice A zero reserve or threshold is refused at deployment.
+    function test_ConstructorRefusesZeroEconomics() public {
+        vm.expectRevert(SweepBondingCurve.InvalidLaunchEconomics.selector);
+        new SweepBondingCurve(0, THRESHOLD);
+        vm.expectRevert(SweepBondingCurve.InvalidLaunchEconomics.selector);
+        new SweepBondingCurve(PHANTOM, 0);
+    }
+
     /// @notice A sale cannot name the factory as its recipient. The factory accepts ETH from any
     /// curve it deployed, because that is how graduation reserves arrive, and has no function
     /// that moves ETH out again: a sale paid there would strand the seller's ETH for good and
-    /// break "the factory holds no ETH between transactions".
+    /// break "the factory holds no ETH between transactions" (audit 2026-10-02, L-2).
     function test_SellRefusesTheFactoryAsRecipient() public {
         uint256 held = _buy(alice, 1 ether);
         vm.startPrank(alice);
         token.approve(address(curve), held);
         vm.expectRevert(SweepBondingCurve.InvalidRecipient.selector);
         curve.sell(held, 0, address(this));
+        vm.stopPrank();
+    }
+
+    /// @notice Nor the token: a desk strategy is the token, and its `receive` takes any ETH with
+    /// no ledger that records or returns it, so a sale paid there strands the seller's ETH.
+    function test_SellRefusesTheTokenAsRecipient() public {
+        uint256 held = _buy(alice, 1 ether);
+        vm.startPrank(alice);
+        token.approve(address(curve), held);
+        vm.expectRevert(SweepBondingCurve.InvalidRecipient.selector);
+        curve.sell(held, 0, address(token));
         vm.stopPrank();
     }
 
@@ -331,18 +367,27 @@ contract BondingCurveTest is Test {
     }
 
     /// @notice After the crossing buy the real reserve sits on the threshold to within trade
-    /// rounding, which is the ETH the pool will be seeded with.
-    function test_TheCrossingBuyGraduatesAndSweepsInOneTransaction() public {
+    /// rounding, which is the ETH the pool will be seeded with. The fees stay owed in their
+    /// buckets: graduation only flips the flag, and pays nobody (e2e fork finding, 2026-10-05).
+    ///
+    /// @dev This replaced `test_TheCrossingBuyGraduatesAndSweepsInOneTransaction`, which pinned
+    /// the sweep inside graduation — the very coupling that let a gas-burning fee recipient starve
+    /// the crossing buy's auto-graduation. The payout is pinned by
+    /// `test_FeesOwedAtGraduationAreSweptToTheirFixedRecipients`.
+    function test_TheCrossingBuyGraduatesAndLeavesTheFeesOwed() public {
         _buy(alice, 1 ether);
         vm.prank(whale);
         curve.buy{value: 10 ether}(0, whale);
 
         assertTrue(curve.graduated());
-        assertEq(curve.protocolFeeBalance(), 0);
-        assertEq(curve.creatorFeeBalance(), 0);
-        assertApproxEqAbs(curve.trackedQuote(), THRESHOLD, 1e3);
-        assertGt(protocolRecipient.balance, 0);
-        assertGt(creator.balance, 0);
+        uint256 owed = curve.protocolFeeBalance() + curve.creatorFeeBalance();
+        assertGt(curve.protocolFeeBalance(), 0);
+        assertGt(curve.creatorFeeBalance(), 0);
+        assertApproxEqAbs(curve.realQuoteReserve(), THRESHOLD, 1e3);
+        assertEq(curve.trackedQuote(), curve.realQuoteReserve() + owed);
+        assertEq(address(curve).balance, curve.trackedQuote());
+        assertEq(protocolRecipient.balance, 0);
+        assertEq(creator.balance, 0);
     }
 
     /// @notice Slippage is a bound on the price paid, not the quantity received: a clamped fill
@@ -387,36 +432,29 @@ contract BondingCurveTest is Test {
         curve.quoteSell(1e18);
     }
 
-    /// @notice A crossing buy starved of gas by its caller cannot be allowed to fail: the buy
-    /// lands, the flag stays down, both trade directions refuse the ready-but-unflagged window,
-    /// and anyone can then settle the launch permissionlessly.
+    /// @notice A crossing buy whose graduation fails cannot be allowed to fail: the buy lands,
+    /// the flag stays down, both trade directions refuse the ready-but-unflagged window, and
+    /// anyone can then settle the launch permissionlessly.
     ///
-    /// @dev With plain recipients graduation is so cheap the 63/64 rule protects it — by the
-    /// time a sixty-fourth of the gas can carry the catch, sixty-three can carry the sweep. The
-    /// starvation the try/catch exists for needs an adversarial recipient, so the creator here
-    /// burns its entire force-send stipend, and the loop walks the gas limit until it finds the
-    /// window that completes the buy but not the graduation.
+    /// @dev Graduation used to pay the fee recipients, which made it expensive enough for a
+    /// gas-burning creator to starve under the 63/64 rule, and this test walked the gas limit to
+    /// find that window. Graduation now only flips the flag, so no gas limit opens the window
+    /// any more (`test_NoGasLimitCompletesTheCrossingBuyWithoutGraduating`); the try/catch still
+    /// guards the buy against any other failure of the self-call, so the failure is injected
+    /// here directly by mocking the self-call to revert, and the rest of the property — the buy
+    /// survives, the window is closed, anyone settles — is pinned exactly as before.
     function test_AutoGraduationFailureNeverRevertsTheCrossingBuy() public {
         (SweepBondingCurve starved, CurveTestToken starvedToken) = _deployCurve(address(new GasEater()));
         vm.warp(START + 5);
 
-        bool found;
-        for (uint256 gas = 200_000; gas <= 3_000_000; gas += 10_000) {
-            uint256 snapshot = vm.snapshotState();
-            vm.prank(whale);
-            try starved.buy{value: 20 ether, gas: gas}(0, whale) {
-                if (!starved.graduated()) {
-                    found = true;
-                    break;
-                }
-                vm.revertToState(snapshot);
-                break;
-            } catch {
-                vm.revertToState(snapshot);
-            }
-        }
+        vm.mockCallRevert(address(starved), abi.encodeCall(SweepBondingCurve.graduate, ()), "starved");
+        vm.expectEmit(false, false, false, false, address(starved));
+        emit SweepBondingCurve.AutoGraduationFailed(0);
+        vm.prank(whale);
+        starved.buy{value: 20 ether}(0, whale);
+        vm.clearMockedCalls();
 
-        assertTrue(found, "no gas limit starved graduation while completing the buy");
+        assertFalse(starved.graduated());
         assertEq(starved.sellableTokens(), 0);
         assertTrue(starved.readyToGraduate());
 
@@ -430,15 +468,79 @@ contract BondingCurveTest is Test {
         starved.sell(1e18, 0, whale);
         vm.stopPrank();
 
-        starved.sweepFees();
         starved.graduate();
         assertTrue(starved.graduated());
+    }
+
+    /// @notice A creator recipient that burns every drop of gas it is paid with cannot make the
+    /// crossing buy leave its graduation failed at the gas limit a wallet actually sends.
+    ///
+    /// @dev The e2e mainnet-fork finding of 2026-10-05: with such a creator, the crossing buy
+    /// sent at the wallet's estimate (257,603) or the web's estimate + 25% (322,004) landed but
+    /// emitted `AutoGraduationFailed`, because graduation paid the fee recipients by force and
+    /// the force-send burnt its whole 100k stipend inside the 63/64 share the self-call gets. The
+    /// call gas here is those transaction limits less the 21,000 intrinsic and a 1,000 allowance
+    /// for the buy's calldata, which is what reaches the curve.
+    function test_AGasBurningCreatorCannotStarveTheCrossingBuysGraduation() public {
+        uint256[2] memory txGasLimits = [uint256(257_603), uint256(322_004)];
+        for (uint256 i = 0; i < txGasLimits.length; ++i) {
+            (SweepBondingCurve hostile,) = _deployCurve(address(new GasEater()));
+            vm.warp(block.timestamp + 5);
+
+            vm.recordLogs();
+            vm.prank(whale);
+            hostile.buy{value: 20 ether, gas: txGasLimits[i] - 21_000 - 1000}(0, whale);
+
+            assertTrue(hostile.graduated(), "the crossing buy left graduation failed");
+            assertFalse(_emittedAutoGraduationFailed(address(hostile)), "AutoGraduationFailed was emitted");
+        }
+    }
+
+    /// @notice There is no gas limit at all that completes the crossing buy and leaves the
+    /// launch ungraduated, whoever the fee recipients are: graduation pays nobody, so the 63/64
+    /// share the self-call gets always covers it whenever the remaining sixty-fourth could have
+    /// carried the catch and the rest of the buy.
+    ///
+    /// @dev Both recipients burn their stipend — the protocol's through the hook's live
+    /// recipient — so this is the most expensive payout the old graduation could have faced. The
+    /// walk runs from below the cheapest successful buy to well past the old window, in steps of
+    /// a thousand gas.
+    function test_NoGasLimitCompletesTheCrossingBuyWithoutGraduating() public {
+        feeHook.setProtocolFeeRecipient(address(new GasEater()));
+        (SweepBondingCurve hostile,) = _deployCurve(address(new GasEater()));
+        vm.warp(START + 5);
+
+        uint256 landed;
+        for (uint256 gas = 60_000; gas <= 600_000; gas += 1000) {
+            uint256 snapshot = vm.snapshotState();
+            vm.prank(whale);
+            try hostile.buy{value: 20 ether, gas: gas}(0, whale) {
+                ++landed;
+                assertTrue(hostile.graduated(), "a crossing buy landed without graduating");
+            } catch {}
+            vm.revertToState(snapshot);
+        }
+        assertGt(landed, 0, "no gas limit completed the crossing buy");
+    }
+
+    /// @dev True when `emitter` logged `AutoGraduationFailed` since the last `vm.recordLogs`.
+    function _emittedAutoGraduationFailed(address emitter) internal returns (bool) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == emitter && logs[i].topics[0] == SweepBondingCurve.AutoGraduationFailed.selector) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /* ────────────────────────── donations ────────────────────────── */
 
     /// @notice Reserves are counters, not balances: forced ETH and donated tokens sit outside the
     /// books, move no price, bring graduation no closer, and are stranded rather than pooled.
+    ///
+    /// @dev The factory receives the real reserve; the owed fees stay until swept, after which
+    /// the donation is all the curve holds.
     function test_DonationsNeverMoveThePriceAndNeverReachThePool() public {
         uint256 held = _buy(alice, 1 ether);
         (uint256 quoteBefore, uint256 tokensBefore) = curve.getReserves();
@@ -456,15 +558,16 @@ contract BondingCurveTest is Test {
 
         vm.prank(whale);
         curve.buy{value: 10 ether}(0, whale);
-        uint256 trackedQuote = curve.trackedQuote();
+        uint256 realQuote = curve.realQuoteReserve();
         uint256 trackedTokens = curve.trackedTokens();
         uint256 ethBefore = address(this).balance;
 
         (uint256 ethOut, uint256 tokenOut) = curve.completeGraduation();
 
-        assertEq(ethOut, trackedQuote);
+        assertEq(ethOut, realQuote);
         assertEq(tokenOut, trackedTokens);
         assertEq(address(this).balance, ethBefore + ethOut);
+        curve.sweepFees();
         assertEq(address(curve).balance, 5 ether);
         assertEq(token.balanceOf(address(curve)), held / 2);
     }
@@ -513,8 +616,11 @@ contract BondingCurveTest is Test {
         assertEq(protocolRecipient.balance, 0.03 ether);
     }
 
-    /// @notice A recipient that reverts on receive is paid by force and cannot hold the crossing
-    /// buy's automatic sweep hostage.
+    /// @notice A recipient that reverts on receive cannot hold graduation hostage, and is still
+    /// paid by force when the buckets are swept.
+    ///
+    /// @dev Graduation no longer pays anyone, so the sink cannot even be reached from it; the
+    /// force payment it used to be pinned by moved to `sweepFees`, and is pinned there.
     function test_ARevertingCreatorRecipientCannotBlockGraduation() public {
         RejectingSink sink = new RejectingSink();
         (SweepBondingCurve guarded,) = _deployCurve(address(sink));
@@ -522,54 +628,155 @@ contract BondingCurveTest is Test {
 
         vm.prank(whale);
         guarded.buy{value: 10 ether}(0, whale);
-
         assertTrue(guarded.graduated());
-        assertGt(address(sink).balance, 0);
+
+        uint256 owed = guarded.creatorFeeBalance();
+        assertGt(owed, 0);
+        guarded.sweepFees();
+        assertEq(address(sink).balance, owed);
         assertEq(guarded.creatorFeeBalance(), 0);
+    }
+
+    /// @notice Fees owed when the launch graduates still reach their fixed recipients, exactly,
+    /// through the permissionless sweep — on a graduated curve, after the factory has taken the
+    /// reserves, and with nothing left behind.
+    function test_FeesOwedAtGraduationAreSweptToTheirFixedRecipients() public {
+        _buy(alice, 1 ether);
+        vm.prank(whale);
+        curve.buy{value: 10 ether}(0, whale);
+        uint256 protocolOwed = curve.protocolFeeBalance();
+        uint256 creatorOwed = curve.creatorFeeBalance();
+
+        curve.completeGraduation();
+        vm.prank(makeAddr("stranger"));
+        curve.sweepFees();
+
+        assertEq(protocolRecipient.balance, protocolOwed);
+        assertEq(creator.balance, creatorOwed);
+        assertEq(curve.protocolFeeBalance(), 0);
+        assertEq(curve.creatorFeeBalance(), 0);
+        assertEq(curve.trackedQuote(), 0);
+        assertEq(address(curve).balance, 0, "ETH stranded on the curve");
+    }
+
+    /// @notice A creator that burns all the gas it is paid with is still paid, by force, in
+    /// full, and cannot keep the protocol's share from being paid alongside it.
+    function test_AGasBurningCreatorIsPaidByForceWhenTheFeesAreSwept() public {
+        GasEater eater = new GasEater();
+        (SweepBondingCurve hostile,) = _deployCurve(address(eater));
+        vm.warp(START + 5);
+        vm.prank(whale);
+        hostile.buy{value: 20 ether}(0, whale);
+        uint256 protocolOwed = hostile.protocolFeeBalance();
+        uint256 creatorOwed = hostile.creatorFeeBalance();
+
+        hostile.sweepFees();
+
+        assertEq(address(eater).balance, creatorOwed);
+        assertEq(protocolRecipient.balance, protocolOwed);
+        assertEq(hostile.protocolFeeBalance() + hostile.creatorFeeBalance(), 0);
+    }
+
+    /// @notice The factory receives exactly the real reserve — the same 4.2 ETH whether the fees
+    /// were swept before the handover or are still owed — and the curve keeps exactly the owed
+    /// fees, so the books still match the balance wei for wei on both sides of the handover.
+    function test_CompleteGraduationHandsOverTheRealReserveAndKeepsTheOwedFees() public {
+        _buy(alice, 1 ether);
+        vm.prank(whale);
+        curve.buy{value: 10 ether}(0, whale);
+        uint256 owed = curve.protocolFeeBalance() + curve.creatorFeeBalance();
+        uint256 realReserve = curve.realQuoteReserve();
+
+        uint256 snapshot = vm.snapshotState();
+        curve.sweepFees();
+        (uint256 ethOutAfterSweep,) = curve.completeGraduation();
+        vm.revertToState(snapshot);
+
+        uint256 factoryBefore = address(this).balance;
+        (uint256 ethOut, uint256 tokenOut) = curve.completeGraduation();
+
+        assertEq(ethOut, realReserve);
+        assertEq(ethOut, ethOutAfterSweep, "the seed depends on when the fees were swept");
+        assertApproxEqAbs(ethOut, THRESHOLD, 1e3);
+        assertEq(tokenOut, RESERVED);
+        assertEq(address(this).balance, factoryBefore + ethOut);
+        assertEq(curve.trackedQuote(), owed);
+        assertEq(address(curve).balance, owed);
+        assertEq(curve.realQuoteReserve(), 0);
+        (uint256 quoteReserve, uint256 tokenReserve) = curve.getReserves();
+        assertEq(quoteReserve, PHANTOM);
+        assertEq(tokenReserve, 0);
     }
 
     /* ────────────────────────── graduation ────────────────────────── */
 
-    /// @notice The flag is set before a single wei of fees leaves, so a recipient re-entering
-    /// from inside the sweep's payment meets a closed market — refused by the flag itself, not
-    /// by the reentrancy guard, which a directly-called `graduate` never holds.
+    /// @notice Graduation hands control to nobody: a fee recipient armed to re-enter is never
+    /// called by `graduate`, whoever calls it, so there is no instant at which it could trade
+    /// against a half-graduated curve.
     ///
-    /// @dev The auto-graduated path is already double-covered: there `buy`'s own lock refuses
-    /// the re-entry before the flag is even read. The path where the flag is the only defence is
-    /// a keeper's or stranger's direct `graduate` after a starved crossing buy, so that exact
-    /// state is built here: the protocol recipient burns its stipend to open the starvation
-    /// window, and the creator is the re-entering recipient.
-    function test_GraduatedIsSetBeforeFeesLeave() public {
-        feeHook.setProtocolFeeRecipient(address(new GasEater()));
+    /// @dev This replaced `test_GraduatedIsSetBeforeFeesLeave`. That ordering defended the sweep
+    /// graduation used to run, whose ETH sends could hand control to a recipient while only the
+    /// flag closed the market. Graduation no longer sweeps, so the property it protected is now
+    /// stronger — no external call at all — and the re-entry it modelled moved to `sweepFees`,
+    /// pinned by `test_ARecipientReenteringTheSweepOfAGraduatedCurveMeetsAClosedMarket`. The
+    /// ready-but-unflagged state a direct `graduate` needs is built by injecting the self-call
+    /// failure, since no gas limit produces it any more.
+    function test_GraduateHandsControlToNobody() public {
         ReenteringRecipient reenter = new ReenteringRecipient();
         (SweepBondingCurve hot,) = _deployCurve(address(reenter));
         vm.deal(address(reenter), 1 ether);
         vm.warp(START + 5);
 
-        bool found;
-        for (uint256 gas = 200_000; gas <= 3_000_000; gas += 10_000) {
-            uint256 snapshot = vm.snapshotState();
-            vm.prank(whale);
-            try hot.buy{value: 20 ether, gas: gas}(0, whale) {
-                if (!hot.graduated()) {
-                    found = true;
-                    break;
-                }
-                vm.revertToState(snapshot);
-                break;
-            } catch {
-                vm.revertToState(snapshot);
-            }
-        }
-        assertTrue(found, "no gas limit starved graduation while completing the buy");
+        vm.mockCallRevert(address(hot), abi.encodeCall(SweepBondingCurve.graduate, ()), "starved");
+        vm.prank(whale);
+        hot.buy{value: 20 ether}(0, whale);
+        vm.clearMockedCalls();
+        assertTrue(hot.readyToGraduate());
 
         reenter.arm(ICurveLike(address(hot)));
         hot.graduate();
 
         assertTrue(hot.graduated());
+        assertFalse(reenter.attempted(), "graduate handed control to a fee recipient");
+        assertGt(hot.creatorFeeBalance(), 0);
+    }
+
+    /// @notice A creator recipient re-entering from inside the sweep of a graduated curve meets a
+    /// closed market: its buy is refused and the books it could have refilled stay zeroed.
+    function test_ARecipientReenteringTheSweepOfAGraduatedCurveMeetsAClosedMarket() public {
+        ReenteringRecipient reenter = new ReenteringRecipient();
+        (SweepBondingCurve hot,) = _deployCurve(address(reenter));
+        vm.deal(address(reenter), 1 ether);
+        vm.warp(START + 5);
+        vm.prank(whale);
+        hot.buy{value: 20 ether}(0, whale);
+        uint256 trackedTokens = hot.trackedTokens();
+
+        reenter.arm(ICurveLike(address(hot)));
+        hot.sweepFees();
+
         assertTrue(reenter.attempted());
         assertTrue(reenter.observedGraduated());
-        assertEq(bytes4(reenter.buyRevertReason()), SweepBondingCurve.CurveGraduated.selector);
+        assertGt(reenter.buyRevertReason().length, 0, "the re-entering buy was not refused");
+        assertEq(hot.protocolFeeBalance() + hot.creatorFeeBalance(), 0);
+        assertEq(hot.trackedTokens(), trackedTokens);
+        assertEq(address(hot).balance, hot.trackedQuote());
+    }
+
+    /// @notice A gas-burning creator cannot block a direct `graduate` either: it costs the same
+    /// one storage write whoever the recipients are, well inside 50,000 gas, where paying the
+    /// creator by force used to need more than its whole 100,000-gas stipend.
+    function test_AGasBurningCreatorCannotBlockGraduate() public {
+        (SweepBondingCurve hostile,) = _deployCurve(address(new GasEater()));
+        vm.warp(START + 5);
+        vm.mockCallRevert(address(hostile), abi.encodeCall(SweepBondingCurve.graduate, ()), "starved");
+        vm.prank(whale);
+        hostile.buy{value: 20 ether}(0, whale);
+        vm.clearMockedCalls();
+
+        hostile.graduate{gas: 50_000}();
+
+        assertTrue(hostile.graduated());
     }
 
     /// @notice Graduating twice, or before the curve is full, is refused by name.
@@ -587,6 +794,9 @@ contract BondingCurveTest is Test {
 
     /// @notice Only the factory may take the reserves, only after the flag, and the handover
     /// zeroes the books and tells the token — which is what resets the desk's bid ramp.
+    ///
+    /// @dev Since graduation stopped sweeping (2026-10-05), the handover leaves `trackedQuote`
+    /// holding exactly the fees still owed, and the books reach zero once they are swept.
     function test_CompleteGraduationIsOnlyForTheFactoryAndOnlyAfterTheFlag() public {
         vm.expectRevert(SweepBondingCurve.NotGraduated.selector);
         curve.completeGraduation();
@@ -603,10 +813,12 @@ contract BondingCurveTest is Test {
 
         assertApproxEqAbs(ethOut, THRESHOLD, 1e3);
         assertEq(tokenOut, RESERVED);
-        assertEq(curve.trackedQuote(), 0);
+        assertEq(curve.trackedQuote(), curve.protocolFeeBalance() + curve.creatorFeeBalance());
         assertEq(curve.trackedTokens(), 0);
         assertEq(token.balanceOf(address(this)), RESERVED);
         assertEq(token.markGraduatedCalls(), 1);
+        curve.sweepFees();
+        assertEq(curve.trackedQuote(), 0);
         assertEq(token.lastGraduationCaller(), address(curve));
 
         vm.expectRevert(SweepBondingCurve.NothingToComplete.selector);

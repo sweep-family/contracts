@@ -14,9 +14,9 @@ import {SwapSimulator} from "./mocks/SwapSimulator.sol";
  * @author 0xDAVZER
  * @notice Pins the token, the transfer lock, the bid and the burn accounting.
  *
- * @dev Weighted toward the time-paced bid, the treasury bound on that bid and the retunable burn
- * pacing, because those are the claims most easily got wrong. Everything else here is a guard rail
- * against regressions.
+ * @dev Weighted toward the three corrections we make to the reference, because those are the claims
+ * that are ours rather than inherited. Everything else here is a guard rail against regressions in
+ * behaviour we deliberately kept.
  */
 contract StrategyBaseTest is Test {
     StrategyHarness internal strategy;
@@ -106,8 +106,8 @@ contract StrategyBaseTest is Test {
     }
 
     /// @notice Only the owner may punch a hole in the transfer lock.
-    /// @dev The power exists because the router needs it; anyone else holding it could open the lock
-    /// for arbitrary addresses and route around the fee.
+    /// @dev The reference makes this `onlyOwner` while its NatSpec claims `onlyFactory`. We keep the
+    /// power because the router needs it, and name it honestly.
     function test_OnlyOwnerCanWhitelistADistributor() public {
         vm.prank(alice);
         vm.expectRevert();
@@ -115,18 +115,27 @@ contract StrategyBaseTest is Test {
     }
 
     /// @notice The owner cannot change the curve's entry, in either direction.
-    /// @dev Delisting the curve would freeze every buy, every sell and the graduation itself,
-    /// holding the buyers' ETH on the curve at the owner's pleasure — an owner power over curve
-    /// reserves that the design says does not exist. Re-granting is
+    /// @dev Audit 2026-10-02, M-1. Delisting the curve froze every buy, every sell and the
+    /// graduation itself, holding the buyers' ETH on the curve at the owner's pleasure — an
+    /// owner power over curve reserves that decision 0014 says does not exist. Re-granting is
     /// refused too, so the entry has one writer, initialisation.
     function test_SetDistributorCannotTouchTheCurve() public {
         vm.startPrank(owner);
-        vm.expectRevert(SweepToken.CurveDistributorFixed.selector);
+        vm.expectRevert(SweepToken.DistributorEntryFixed.selector);
         strategy.setDistributor(curve, false);
-        vm.expectRevert(SweepToken.CurveDistributorFixed.selector);
+        vm.expectRevert(SweepToken.DistributorEntryFixed.selector);
         strategy.setDistributor(curve, true);
         vm.stopPrank();
         assertTrue(strategy.isDistributor(curve));
+    }
+
+    /// @notice Nor the strategy's own entry. A recursive strategy is a distributor on itself
+    /// — its airdrops leave its own balance — and delisting that entry froze every claim and
+    /// every distribution with the holders' reserved tokens inside.
+    function test_SetDistributorCannotTouchTheStrategyItself() public {
+        vm.prank(owner);
+        vm.expectRevert(SweepToken.DistributorEntryFixed.selector);
+        strategy.setDistributor(address(strategy), true);
     }
 
     /* ──────────────────────────── the bid ──────────────────────────── */
@@ -165,9 +174,10 @@ contract StrategyBaseTest is Test {
 
     /**
      * @notice The bid never exceeds what the treasury actually holds.
-     * @dev A ramp that ignores the treasury publishes a bid the desk cannot pay, and a stored bound
-     * that is only re-pinned on large fee deposits never fires in low volume. Computing the bound on
-     * read rather than storing it makes that class of bug impossible.
+     * @dev Observed live on the reference: a 36.98 ETH bid against a 0.43 ETH treasury, because its
+     * re-pin only fired when a single fee deposit exceeded the increment, which in low volume never
+     * happens. Computing the bound on read rather than storing it makes that class of bug
+     * impossible.
      */
     function test_BidNeverExceedsTheTreasury() public {
         strategy.exposed_fund(0.5 ether);
@@ -182,14 +192,17 @@ contract StrategyBaseTest is Test {
         assertEq(strategy.currentBid(), 0);
     }
 
-    /// @notice A purchase resets the ramp, so the next seller starts from the bottom again.
-    function test_BidResetsAfterAPurchase() public {
+    /// @notice A purchase gives up the part of the ramp it spent (SC-07): the bid falls by the
+    /// cost, and the treasury pays it. A purchase at the whole bid still restarts from zero; that
+    /// case and the dust case are pinned in `RampConsumption.t.sol`.
+    function test_APurchaseGivesUpTheRampItSpent() public {
         strategy.exposed_fund(10 ether);
         vm.warp(block.timestamp + 1000);
-        assertGt(strategy.currentBid(), 0.9 ether);
+        uint256 bid = strategy.currentBid();
+        assertGt(bid, 0.9 ether);
 
         strategy.exposed_recordPurchase(0.5 ether);
-        assertEq(strategy.currentBid(), 0, "the ramp restarts at zero");
+        assertEq(strategy.currentBid(), bid - 0.5 ether, "the ramp gives up what was spent");
         assertEq(strategy.treasury(), 9.5 ether, "and the treasury pays for it");
     }
 
@@ -326,11 +339,11 @@ contract StrategyBaseTest is Test {
     /**
      * @notice A distributor's leg through the PoolManager spends the hook's allowance like
      * anyone's.
-     * @dev Read the other way round — the distributor exemption before the pool rule — a
-     * distributor could move tokens into or out of the PoolManager with no swap at all. The
-     * curve is a distributor: a curve buy delivered to the PoolManager inside an unlock would be
-     * minted as ERC-6909 claims that moved wallet to wallet and funded a hookless pool — the
-     * escape the router allow-list closes for swaps, reopened through the launch market.
+     * @dev Audit 2026-10-02, H-1. The distributor exemption used to be read before the pool
+     * rule, so a distributor could move tokens into or out of the PoolManager with no swap at
+     * all. The curve is a distributor: a curve buy delivered to the PoolManager inside an unlock
+     * was minted as ERC-6909 claims that moved wallet to wallet and funded a hookless pool —
+     * the escape decision 0010 closed for swaps, reopened through the launch market.
      */
     function test_ADistributorLegThroughThePoolManagerSpendsTheAllowance() public {
         (StrategyHarness s, SwapSimulator pool) = _strategyWithSimulatedPool();
@@ -346,6 +359,22 @@ contract StrategyBaseTest is Test {
 
         pool.authoriseAndMove(s, curve, 3e18, 3e18);
         assertEq(s.balanceOf(curve), 1003e18, "an authorised pool leg to a distributor was refused");
+    }
+
+    /// @notice A leg out of the PoolManager to the dead address spends the allowance like any
+    /// other: the dead-address exemption is for burning one's own balance, and read before the
+    /// pool rule it let such a leg pass free, leaving the hook's grant open for the rest of the
+    /// transaction.
+    function test_APoolLegToTheDeadAddressNeedsTheAllowance() public {
+        (StrategyHarness s, SwapSimulator pool) = _strategyWithSimulatedPool();
+        s.exposed_credit(address(pool), 1000e18);
+        address dead = s.DEAD_ADDRESS();
+
+        vm.expectRevert(SweepToken.TransferNotAllowed.selector);
+        pool.authoriseAndMove(s, dead, 0, 1e18);
+
+        pool.authoriseAndMove(s, dead, 1e18, 1e18);
+        assertEq(s.balanceOf(dead), 1e18);
     }
 
     /// @notice A grant is readable inside the transaction that made it, and nowhere else.
@@ -428,9 +457,10 @@ contract StrategyBaseTest is Test {
 
     /**
      * @notice The owner can retune the burn pace after launch.
-     * @dev Without a setter, a strategy launched with the wrong rhythm would be stuck with it for
-     * life short of upgrading the proxy — a very large hammer for a very small nail. The unit is not
-     * adjustable and never will be: seconds are baked in, and only the duration moves.
+     * @dev Neither the reference nor our first draft had a setter here, so a strategy launched with
+     * the wrong rhythm was stuck with it for life short of upgrading the proxy — a very large hammer
+     * for a very small nail. The unit is not adjustable and never will be: seconds are baked in, and
+     * only the duration moves.
      */
     function test_OwnerCanRetuneTheBurnPacing() public {
         vm.prank(owner);
@@ -441,7 +471,7 @@ contract StrategyBaseTest is Test {
     }
 
     /// @notice A strategy opens with a burn pass of 0.1 ETH.
-    /// @dev The graduated pool's depth is fixed at its ~4.2 ETH seed, and
+    /// @dev Audit 2026-10-02, M-2. The graduated pool's depth is fixed at its ~4.2 ETH seed, and
     /// on a fork a one-transaction sandwich around a 1 ETH pass took about 6% of it; the scan
     /// put the break-even near 0.33 ETH. The default sits a third of the way there, so the pool
     /// can lose most of its ETH side before the default pass becomes worth sandwiching.
@@ -514,8 +544,8 @@ contract StrategyBaseTest is Test {
 
     /**
      * @notice The owner can retune the bid after launch, within the launch gates and the raise
-     * pacing. Replaces the unbounded setter's tests: the freedom they pinned was a drain, and the
-     * bounds remove it.
+     * pacing. Replaces the unbounded setter's tests: the freedom they pinned was the drain the
+     * pre-mainnet review named, and decision 0015 removed it.
      */
     function test_OwnerCanRetuneTheBidWithinTheBounds() public {
         vm.warp(block.timestamp + strategy.BID_RAISE_COOLDOWN());

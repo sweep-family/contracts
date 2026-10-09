@@ -14,7 +14,7 @@ import {SweepForkTest} from "./shared/SweepForkTest.sol";
 /**
  * @title EndToEndTest
  * @author 0xDAVZER
- * @notice The whole machine, once around, on the real chain. Every contract has its own suite; this is
+ * @notice The whole machine, once around, on the real chain. Every brick has its own suite; this is
  * the one test that says they fit together. It prints what it sees, because the numbers are the
  * point: what a trade costs, what the treasury holds, what the bid says, what a burn destroys.
  */
@@ -59,10 +59,10 @@ contract EndToEndTest is SweepForkTest {
     }
 
     /// @dev The first buy of the pool's life pays the flat 10%, 80% of it into the treasury —
-    /// the same deal as every buy after it, since the fee has no launch ramp. The band is wider
-    /// than 8% ± rounding because the graduated pool is 4.2 ETH deep: the hook converts its token
-    /// fee by selling into the pool the buy just moved, so price impact cuts a visible slice both
-    /// ways.
+    /// the same deal as every buy after it, since decision 0012 removed the launch ramp. The
+    /// band is wider than 8% ± rounding because the graduated pool is 4.2 ETH deep (decision
+    /// 0013): the hook converts its token fee by selling into the pool the buy just moved, so
+    /// price impact cuts a visible slice both ways.
     function _stage2FirstBuy() internal {
         _buy(key, 1 ether);
         assertGt(s.treasury(), 0.07 ether, "the first buy funded less than eight percent");
@@ -89,14 +89,16 @@ contract EndToEndTest is SweepForkTest {
         console2.log("4. bid now          %s wei  (treasury %s wei)", bid, s.treasury());
     }
 
-    /// @dev A seller lists below the bid; the desk sweeps it, and the ramp restarts.
+    /// @dev A seller lists below the bid; the desk sweeps it, and the ramp gives up exactly what
+    /// the sweep spent (SC-07).
     function _stage5Sweep() internal {
+        uint256 bidBefore = s.currentBid();
         tokenId = collection.mint(address(this));
         collection.setApprovalForAll(address(market), true);
         market.list(address(collection), tokenId, floor);
         s.buyTargetNFT(floor, abi.encodeCall(market.fulfill, (address(collection), tokenId)), tokenId, address(market));
         assertEq(collection.ownerOf(tokenId), address(s));
-        assertEq(s.currentBid(), 0, "the ramp did not restart");
+        assertEq(s.currentBid(), bidBefore - floor, "the ramp did not give up exactly what was spent");
         ask = s.askPrice(tokenId);
         assertEq(ask, (floor * 12_000) / 10_000, "ask is not 1.2x");
         console2.log("5. swept #%s         paid %s wei, ask now %s wei", tokenId, floor, ask);

@@ -39,7 +39,7 @@
 Sweep is a launchpad for strategy tokens on [Robinhood Chain](https://chain.robinhood.com), an
 Arbitrum Orbit L2 with ~101 ms blocks. A launch moves its whole supply of one billion tokens onto
 its own bonding curve, which sells it against a virtual 1.68 ETH reserve until the curve holds
-4.2 ETH of real ETH. The buy that crosses that line graduates the launch: a Uniswap v4 pool opens
+4.2 ETH of real ETH (mainnet values; see [the curve's scale](#the-curves-scale)). The buy that crosses that line graduates the launch: a Uniswap v4 pool opens
 at the curve's exact final price, seeded with every wei the curve took in, and the position NFT
 goes to the dead address, so the liquidity can never be withdrawn by anyone. From then on every
 trade on the pool pays a ten percent fee to a hook. Eighty percent of that fee funds a treasury
@@ -65,7 +65,8 @@ A launch records on its event whether the launcher was the target's own `owner()
 and grants nothing else for it. Any number of strategies may exist on the same target.
 
 The recursive strategy keeps no treasury and no desk. Its fees queue as ETH; `distribute()` buys
-the token back through the burn router, and `claimFor()` hands what was bought to every holder in
+the token back through the burn router, at most once every 12 seconds and never more than the
+same depth bound a burn pass obeys, and `claimFor()` hands what was bought to every holder in
 proportion to their balance, as plain transfers. The split is a reward accumulator settled inside
 the token's transfer hook, so a balance only earns from distributions it was held through. The
 pool, the dead address, the hook, the router, the curve, the factory and the strategy itself are
@@ -111,11 +112,12 @@ excluded, fixed at launch, with no setter. Curve buyers are holders from their f
                                  ▼
    ┌────────────── SweepBurnRouter ───────────────────────────────────┐
    │  buys the strategy's own token on its own pool                   │
+   │  never more than 4% of the pool's live ETH reserve per buy       │
    │  delivers it to 0x…dEaD                                          │
    └──────────────────────────────────────────────────────────────────┘
 ```
 
-Five design choices worth knowing before reading the code:
+Six design choices worth knowing before reading the code:
 
 - **No rescue path.** The curve has no owner, no setter and no upgrade. Its reserves move to the
   pool in the same transaction that opens it, so they are only ever on the curve or in the pool;
@@ -130,6 +132,13 @@ Five design choices worth knowing before reading the code:
 - **Only listed routers may trade the pool.** The hook refuses a swap whose caller the factory does
   not list, and both shipped routers settle in ERC-20 only. This is what keeps ERC-6909 claim
   balances, which the token's transfer lock cannot see, from ever existing.
+- **Every protocol buy is bounded by the pool's live depth.** The graduated pool is one
+  full-range position nobody can add to, so its ETH side shrinks with the square root of the
+  price. A burn pass or a distribution is the smallest of what is queued, its pacing cap and
+  `SweepBurnRouter.maxBurnBuy`: 4% of the pool's ETH reserve, read from the PoolManager at the
+  moment of the buy. A constant cap that is safe at graduation is sandwichable once the price has
+  fallen; a share of the live reserve keeps the price impact a sandwich feeds on the same at every
+  price, and the cooldown keeps one transaction from chaining bounded buys into an unbounded one.
 - **Fees are pulled, never pushed.** Creator and protocol shares accrue in the hook and are paid
   out by `claimFeesFor(recipient)`, which anyone may call. A recipient that cannot receive ETH
   blocks nobody but itself.
@@ -154,7 +163,8 @@ src/
                                ISweepHookRegistry, ISweepBurnRouter, IOwnable
   testing/                     SweepTestCollection, SweepTestToken: testnet fixtures, never for mainnet
 script/
-  DeploySweep.s.sol            the whole stack: implementations → factory → mined hook → routers
+  DeploySweep.s.sol            the whole stack: implementations → factory → mined hook → routers,
+                               guarded before the first transaction and read back after the last
   DeployHook.s.sol             re-mine and redeploy the hook alone
   DeploySwapRouter.s.sol       redeploy the swap router alone
   DeployTestCollection.s.sol   a fixture collection on a testnet
@@ -196,8 +206,8 @@ in the protocol is upgradeable: a change ships as a new stack.
 | Constant | Value | Where |
 | --- | --- | --- |
 | Supply | 1,000,000,000 tokens, all on the launch's curve | `SweepToken.MAX_SUPPLY` |
-| Opening price | 1.68 ETH FDV: the virtual reserve over the supply | `SweepBondingCurve.PHANTOM_QUOTE` |
-| Graduation | at 4.2 ETH of real ETH on the curve; 5/7 of the supply sellable before it | `SweepBondingCurve.GRADUATION_THRESHOLD` |
+| Opening price | 1.68 ETH FDV on mainnet: the virtual reserve over the supply | `SweepBondingCurve.PHANTOM_QUOTE` (immutable) |
+| Graduation | at 4.2 ETH of real ETH on the curve on mainnet; 5/7 of the supply sellable before it | `SweepBondingCurve.GRADUATION_THRESHOLD` (immutable) |
 | Graduation price | 12.25× the opening price, 20.58 ETH FDV; the pool opens at exactly this price | `SweepNFTStrategyFactory` |
 | Burnt at graduation | 4/49 of the supply (~8.16%), the reserved allocation the pool does not need | `createGraduatedPool` |
 | Curve fees | 1% to the protocol + 2% to the creator, on every curve trade's ETH leg | `SweepBondingCurve` |
@@ -209,13 +219,25 @@ in the protocol is upgradeable: a change ships as a new stack.
 | Resale markup | ×1.20, set on the factory and retunable per strategy by the owner | `resaleMultiplierBps` |
 | Ask decay | off (window 0): a fixed ask; the decay is a lever kept switched off | `SweepDesk.askDecayWindow` |
 | Burn pacing | 0.1 ETH per pass by default, never above 0.25 ETH, 12 s cooldown, 0.5% to the caller | `SweepStrategy.MAX_BURN_INCREMENT` |
+| Burn depth | every protocol buy at most 4% of the pool's live ETH reserve | `SweepBurnRouter.MAX_BURN_DEPTH_BPS` |
 | Bag | `totalSupply / 1000`, sized by the factory, never by a front end | `SweepNFTStrategyFactory.BAG_DIVISOR` |
 | Launch fee | 0.001 ETH by default, exact in both directions | `SweepNFTStrategyFactory.launchFee` |
 | Airdrop floor | 0.001 ETH pending before a distribution runs; shares under 10¹² wei are left in the pot | `SweepRecursiveStrategy` |
+| Airdrop pace | one distribution every 12 s at most, each bounded like a burn pass | `SweepRecursiveStrategy.DISTRIBUTE_COOLDOWN` |
 | Hook permissions | `0x2444`: before-initialize, after-add-liquidity, after-swap, after-swap-returns-delta | `SweepHook.getHookPermissions` |
 
 The hook's address encodes its permissions in its low bits and is mined with CREATE2 over an
 initcode that contains the factory's address, so a new factory always means a new hook.
+
+### The curve's scale
+
+The two quantities that set a curve's scale — the virtual reserve and the graduation threshold —
+are immutables, passed to the curve implementation's and the factory's constructors at
+deployment. Every launch of a stack shares them, no launch can choose its own, and the factory
+refuses a curve implementation whose numbers disagree with its own. On mainnet they are exactly
+1.68 ETH and 4.2 ETH, and the deploy script refuses anything else there. A test network may scale
+both by one factor: that keeps every ratio — the 2/7 reserved, the 12.25× final price, the 4/49
+burnt — and only shrinks the ETH a graduation costs.
 
 ## Trust model
 
@@ -228,7 +250,9 @@ What nobody can do, including the protocol:
 - bypass the fee through a second, unhooked pool: transfers of the token are locked to the curve
   and the pool, every movement through the PoolManager needs the hook's allowance — distributors
   included — and the hook refuses swaps that do not come through a listed router;
-- delist the base swap and burn routers, which are permanent.
+- delist the base swap and burn routers, which are permanent;
+- make a protocol buy larger than the depth bound, or change a token's distributor entry for its
+  own curve or for the token itself.
 
 What the factory owner can do, immediately and with no timelock, on every strategy it owns, within
 the bounds each setter enforces:
@@ -241,6 +265,18 @@ the bounds each setter enforces:
   implementation future launches clone.
 
 Each setter's NatSpec says what the lever reaches and why it exists. The owner is a multisig.
+
+### Handing over a deployment
+
+A deployment is the one step nothing can undo, so `DeploySweep` refuses a bad handover before its
+first transaction. On mainnet the owner must be a Safe that needs at least two signatures — never
+the deploying wallet, never an address without code — and the curve must be exactly 1.68 / 4.2
+ETH. On every chain the fee recipient must accept ETH, because the launch fee and the protocol's
+fee share are paid to it by plain transfer; the script probes it with one wei from a throwaway
+address outside the broadcast. After the broadcast it reads every wired value back from the
+chain — owner, fees and recipients, hook and its flags, routers and their permanence,
+implementations, curve economics — and fails naming the first that does not match.
+`DeploySweepTest` runs the real script against a fork of mainnet, with real Safes.
 The transfer lock is a deliberate product decision and costs composability: no bridging, no
 lending collateral, no wallet-to-wallet sends.
 
@@ -263,14 +299,14 @@ FOUNDRY_PROFILE=coverage forge build                # optimizer off: proves noth
 forge coverage --ir-minimum --report summary
 ```
 
-The fork suites (`Factory`, `FactoryERC20`, `FactoryRecursive`, `BurnRouter`, `SwapRouter`,
-`PoolBypass`, `EndToEnd`, `Invariants`) deploy the protocol against
+The fork suites (`Factory`, `FactoryERC20`, `FactoryRecursive`, `BurnRouter`, `BurnDepth`,
+`SwapRouter`, `PoolBypass`, `EndToEnd`, `Invariants`, `DeploySweep`) deploy the protocol against
 the real Uniswap v4 on Robinhood Chain at block 57,000,000. They need an **archive** endpoint in
 `ROBINHOOD_RPC_URL`: the public RPC does not serve historical state, so the
 harness refuses to start without one rather than failing inside the EVM. Without it, run the rest:
 
 ```bash
-forge test --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,EndToEnd,Invariants,PoolBypass,SwapRouter}.t.sol'
+forge test --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,BurnDepth,DeploySweep,EndToEnd,Invariants,PoolBypass,SwapRouter}.t.sol'
 ```
 
 CI runs both: the unit job on every pull request, the fork job and coverage on every push and on
@@ -288,7 +324,7 @@ PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951`. The rest is in
 
 See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
-- 351 tests across 22 suites: unit suites against mocks, fuzz suites on every piece of arithmetic
+- 370 tests across 24 suites: unit suites against mocks, fuzz suites on every piece of arithmetic
   (the curve's pricing round trip included), invariant suites on the money ledgers and on the
   curve's books, and fork suites that run every launch, curve trade, graduation, pool trade,
   purchase, resale, burn and airdrop against the real Uniswap v4 bytecode on Robinhood Chain. CI

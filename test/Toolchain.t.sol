@@ -22,7 +22,7 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 /**
  * @notice Proves the toolchain resolves every dependency the protocol needs, before any
  * protocol code exists. If this file stops compiling, a dependency moved, and every later
- * contract would then fail for a reason that has nothing to do with its own logic.
+ * brick would then fail for a reason that has nothing to do with its own logic.
  *
  * @dev It exists specifically because `BaseHook` is NOT in v4-periphery 1.0.4 — it lives in
  * the separate `v4-hooks-public` repository, which is an easy thing to get wrong and a
@@ -31,10 +31,10 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
  */
 contract ToolchainTest is Test {
     /**
-     * @notice Pins the tick bounds the factory's position math is derived from.
-     * @dev The launch position is placed against these bounds and the pool's tick spacing. If
-     * v4-core ever moved them, every launch position would be seeded across the wrong range
-     * while still appearing to succeed.
+     * @notice Pins the tick bounds the protocol's seed math is derived from.
+     * @dev The graduation guard computes full-range ticks by truncating these toward zero
+     * against the pool's tick spacing. If v4-core ever moved them, every graduated pool would
+     * be seeded across the wrong range while still appearing to succeed.
      */
     function test_TickMathBoundsAreTheOnesTheProtocolAssumes() public pure {
         assertEq(TickMath.MIN_TICK, -887_272, "MIN_TICK moved");
@@ -42,12 +42,12 @@ contract ToolchainTest is Test {
     }
 
     /**
-     * @notice Pins the real ceiling on either side of a launch position.
+     * @notice Pins the real ceiling on either side of a graduation seed.
      * @dev `Pool.modifyLiquidity` narrows each half of a `BalanceDelta` with
      * `SafeCast.toInt128`, so the *signed* maximum binds even though the PositionManager's
      * `MINT_POSITION` ABI accepts a `uint128`. An amount between the two passes every
-     * field-width check and still reverts inside v4 core, at the last step of a launch. Every
-     * amount bound in the protocol traces back to this number.
+     * field-width check and still reverts inside v4 core — after the curve has already been
+     * drained. Every seed-amount bound in the protocol traces back to this number.
      */
     function test_BalanceDeltaNarrowsToInt128() public pure {
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -57,10 +57,10 @@ contract ToolchainTest is Test {
 
     /**
      * @notice Confirms the per-tick liquidity ceiling is reachable from our remappings.
-     * @dev A launch position initializes both boundary ticks, so the position's own liquidity
+     * @dev A graduation seed initializes both boundary ticks, so the position's own liquidity
      * is the entire `liquidityGross` at each. v4 reverts with `TickLiquidityOverflow` past the
-     * cap a spacing implies — an independent rejection from the amount bounds above, and one a
-     * launch has to respect or it reverts at its last step.
+     * cap a spacing implies — an independent rejection from the amount bounds above, and one
+     * the preflight has to model or graduation fails irrecoverably.
      */
     function test_MaxLiquidityPerTickIsQueryable() public pure {
         assertGt(Pool.tickSpacingToMaxLiquidityPerTick(60), 0);

@@ -15,7 +15,7 @@ interface IMinimalERC20 {
  *
  * @dev Holds an inventory of the strategy's token and hands some over for every ETH it is paid. A
  * real router would price against a pool; here the rate is fixed so a test asserts on the burn's
- * accounting rather than on AMM maths, which belongs to the real router.
+ * accounting rather than on AMM maths, which belongs to brick 5.
  */
 contract MockBurnRouter is ISweepBurnRouter {
     /// @notice Tokens handed over per wei of ETH received.
@@ -37,4 +37,17 @@ contract MockBurnRouter is ISweepBurnRouter {
     }
 
     receive() external payable {}
+
+    /// @notice Stands in for the pool's depth bound; unbounded until a test sets it.
+    uint256 public depthBound = type(uint256).max;
+
+    /// @notice Sets the bound `maxBurnBuy` reports, as a shallow pool would.
+    function setDepthBound(uint256 bound) external {
+        depthBound = bound;
+    }
+
+    /// @notice No pool behind the mock: the bound is whatever the test set.
+    function maxBurnBuy(address) external view returns (uint256) {
+        return depthBound;
+    }
 }

@@ -42,7 +42,7 @@ import {IOwnable} from "./interfaces/IOwnable.sol";
  * @title SweepNFTStrategyFactory
  * @author 0xDAVZER
  * @notice Turns a collection into a market: one token, one curve at launch, one pool at
- * graduation.
+ * graduation (decision 0013).
  *
  * @dev A launch deploys the strategy — which is the token — and moves its entire supply onto a
  * `SweepBondingCurve` clone, where it trades against a virtual reserve until 4.2 ETH of real ETH
@@ -51,11 +51,12 @@ import {IOwnable} from "./interfaces/IOwnable.sol";
  * the swept ETH and the reserved token allocation, its ownership NFT minted to the dead address
  * so nobody can ever withdraw it, and the excess tokens burnt the same way. Reserves move from
  * curve to pool in one transaction, so there is no swept-but-unpooled state and no rescue path
- *.
+ * (decision 0014).
  *
- * @dev Anyone may launch on anything, for the fee. There is no allowlist and no gate on the
- * collection's own `owner()`: a gate on `owner()` would exclude every collection that renounced it
- * and stop nothing, since a launch through another door takes a slot just as permanently. What the
+ * @dev Anyone may launch on anything, for the fee. The reference gates launches to addresses it
+ * has authorised by hand, and an earlier draft here read the collection's own `owner()`; decision
+ * 0009 dropped both, because a gate on `owner()` excludes every collection that renounced it and
+ * stops nothing — the fungible door took an ERC-721 and its slot just as permanently. What the
  * collection's `owner()` now decides is one bit on the launch event: whether the launcher was it.
  * The strategy's owner is this factory's owner whoever launched, so launching grants no power over
  * a contract that will hold other people's money.
@@ -81,12 +82,14 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     int24 public constant TICK_SPACING = 60;
 
     /// @notice The curve's virtual reserve, mirrored so graduation can split the reserves with
-    /// the same number the curve priced them with. `setCurveImplementation` refuses an
-    /// implementation whose constant disagrees, so the mirror cannot drift.
-    uint256 public constant PHANTOM_QUOTE = 1.68 ether;
+    /// the same number the curve priced them with. Immutable, set at deployment, and
+    /// `setCurveImplementation` refuses an implementation that disagrees, so the mirror cannot
+    /// drift. 1.68 ETH on mainnet; the deploy script refuses anything else there.
+    uint256 public immutable PHANTOM_QUOTE;
 
-    /// @notice The curve's graduation threshold, mirrored and verified the same way.
-    uint256 public constant GRADUATION_THRESHOLD = 4.2 ether;
+    /// @notice The curve's graduation threshold, mirrored and verified the same way. 4.2 ETH on
+    /// mainnet.
+    uint256 public immutable GRADUATION_THRESHOLD;
 
     /// @notice Slowest bid ramp a launch may choose: about 0.0036 ETH an hour.
     /// @dev Below this a strategy's published bid never reaches a floor price within any useful
@@ -106,9 +109,9 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
 
     /// @notice A fungible strategy's bag is the target's total supply divided by this.
     ///
-    /// @dev One thousandth of the supply: for a token with a supply of 296,296,296 the bag is
-    /// 296,296.296, large enough to be worth selling and small enough for one holder to bring. It
-    /// is a factory constant rather than a launch argument so that no front end can
+    /// @dev One thousandth of the supply is what the reference's front end sends: for a token with
+    /// a supply of 296,296,296 it launched a bag of 296,296.296, read off a simulated launch on
+    /// 2026-09-10. It is a factory constant rather than a launch argument so that no front end can
     /// launch a bag of one wei, which would sell for the whole treasury at the first tick of the
     /// ramp, or of half the supply, which nobody could ever bring.
     uint256 public constant BAG_DIVISOR = 1000;
@@ -144,6 +147,24 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /// collection, and a stranger has no better information about it than we do.
     uint256 public resaleMultiplierBps = 12_000;
 
+    /// @notice Shortest non-zero ask decay window the factory will launch desks with.
+    /// @dev The name and value the desk's own resale-terms bound uses (DK-1). Under a day, every
+    /// ask reaches cost within hours of the purchase, so a bot buys the shelf back at cost and the
+    /// markup that funds the burn is gone.
+    uint256 public constant MIN_ASK_DECAY_WINDOW = 1 days;
+
+    /// @notice Longest ask decay window the factory will launch desks with.
+    /// @dev Past a month a 1.2x ask falls by under 0.7% of cost a day, which against a falling
+    /// floor strands the shelf exactly as a fixed ask does (decision 0020).
+    uint256 public constant MAX_ASK_DECAY_WINDOW = 30 days;
+
+    /// @notice Seconds over which every new desk's ask falls from its markup back to cost.
+    /// @dev A factory default rather than a launch parameter, like the markup, and three days by
+    /// decision 0020: the 6 October 2026 mainnet fork found the Hoodborn desk holding 54 floor
+    /// pieces that a fixed 1.2x ask would never resell, so the burn they were bought for never ran.
+    /// Zero switches the decay off and restores decision 0004's fixed ask.
+    uint256 public askDecayWindow = 3 days;
+
     /// @inheritdoc ISweepFactory
     bool public loadingLiquidity;
 
@@ -168,6 +189,15 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      */
     mapping(address router => bool allowed) public isRouter;
 
+    /**
+     * @inheritdoc ISweepFactory
+     *
+     * @dev The protocol's keepers, so a desk can follow a rising floor without waiting for the
+     * Safe. Listing here grants `manageBid` on every desk this factory launched, and nothing else:
+     * the bid between zero and each desk's restorable highs. Decision 0019.
+     */
+    mapping(address manager => bool allowed) public isBidManager;
+
     /// @notice The implementation every launch's bonding curve is cloned from.
     address public curveImplementation;
 
@@ -178,7 +208,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /// which is what the `receive` gate reads.
     mapping(address curve => address strategy) public strategyOfCurve;
 
-    /// @notice Routers that can never be delisted. The base swap and burn
+    /// @notice Routers that can never be delisted (decision 0015). The base swap and burn
     /// routers live here, so no owner — honest or compromised — can freeze trading on a token
     /// whose transfer lock makes these routers the only market.
     mapping(address router => bool permanent) public isPermanentRouter;
@@ -186,6 +216,14 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /// @notice The position NFT each graduation minted to the dead address. Zero until the
     /// strategy graduates, which is how "not yet pooled" is spelled.
     mapping(address strategy => uint256 tokenId) public positionIdOf;
+
+    /// @notice Targets the public launch paths accept while launches are curated (decision 0018).
+    mapping(address target => bool admitted) public isLaunchTarget;
+
+    /// @notice Whether the public launch paths accept any target, as decision 0009 had them.
+    /// @dev False at deploy, so the factory opens curated and the deploy window admits no
+    /// stranger's desk on a target nobody vetted.
+    bool public openLaunches;
 
     error HookNotSet();
     error HookAlreadySet();
@@ -204,6 +242,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     error UnknownStrategy();
     error AlreadyPooled();
     error DirectPaymentRejected();
+    error TargetNotAdmitted();
 
     event StrategyLaunched(
         address indexed collection,
@@ -243,11 +282,15 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     event ERC20ImplementationSet(address indexed implementation);
     event RecursiveImplementationSet(address indexed implementation);
     event RouterSet(address indexed router, bool allowed);
+    event AskDecayWindowSet(uint256 window);
     event LaunchFeeSet(uint256 fee, address indexed recipient);
     event ResaleMultiplierSet(uint256 multiplierBps);
+    event LaunchTargetSet(address indexed target, bool admitted);
+    event OpenLaunchesSet(bool open);
+    event BidManagerSet(address indexed manager, bool allowed);
 
-    /// @notice Wires the factory to Uniswap and to the implementation it clones, and proves the
-    /// constant curve economics can seed a v4 pool at all — a misbuilt deployment fails here, at
+    /// @notice Wires the factory to Uniswap and to the implementation it clones, fixes the curve
+    /// economics every launch will use, and proves they can seed a v4 pool at all — a misbuilt deployment fails here, at
     /// deploy time, rather than at the first stranger's graduation.
     /// @dev The hook is deliberately absent. Its address encodes its permissions and is mined over
     /// an initcode containing this factory's address, so it cannot exist yet — see `setHook`.
@@ -257,14 +300,20 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         address poolManager_,
         address strategyImplementation_,
         address launchFeeRecipient_,
-        address owner_
+        address owner_,
+        uint256 phantomQuote_,
+        uint256 graduationThreshold_
     ) {
         if (
             positionManager_ == address(0) || permit2_ == address(0) || poolManager_ == address(0)
                 || strategyImplementation_ == address(0) || launchFeeRecipient_ == address(0) || owner_ == address(0)
+                || phantomQuote_ == 0 || graduationThreshold_ == 0
         ) {
             revert InvalidConfiguration();
         }
+
+        PHANTOM_QUOTE = phantomQuote_;
+        GRADUATION_THRESHOLD = graduationThreshold_;
 
         positionManager = IPositionManager(positionManager_);
         permit2 = IAllowanceTransfer(permit2_);
@@ -286,16 +335,22 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /**
      * @notice Launches a strategy on `collection`. Anyone may call this, for the fee.
      *
-     * @dev There is no ownership gate. One would refuse every collection whose `owner()` is
-     * renounced, cold or lost, which is most of the ones worth sweeping, and it would not be the
-     * protection it looks like: nothing about owning a collection is needed to point a desk at its
-     * floor. What ownership buys
+     * @dev There is no ownership gate, and decision 0009 says why the one there was had to go. It
+     * refused every collection whose `owner()` is renounced, cold or lost, which is most of the
+     * ones worth sweeping, and it never was the protection it looked like: `launchERC20` admitted
+     * an ERC-721 through the same door and took the slot just as permanently. What ownership buys
      * is a badge, not a veto — see `_launch`, which computes it.
      *
      * @dev The launcher is registered with the hook as the creator fee recipient in the same
      * transaction, so the strategy is paid from its first trade with nothing further to sign, and
      * that registration is final: the hook has no second writer. Whoever pays the fee and opens
      * the market keeps the stream, and a collection that turns up afterwards takes nothing.
+     *
+     * @dev `TargetNotAdmitted` refuses a collection the owner has not admitted while launches are
+     * curated (decision 0018). A desk's only proof of delivery is the collection's own answer, so
+     * a collection whose admin can mint, upgrade or seize can sell the desk nothing for its whole
+     * treasury; nothing inside the desk can tell. `ownerLaunch` is not gated, because the owner is
+     * the curator.
      *
      * @dev Every other guard is on `_validateLaunch`, and explained there.
      */
@@ -306,16 +361,17 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         uint256 bidIncreasePerSecond,
         uint256 maxBid
     ) external payable nonReentrant returns (address) {
+        _assertAdmitted(collection);
         return _launch(collection, name_, symbol_, bidIncreasePerSecond, maxBid, msg.sender);
     }
 
     /**
      * @notice Launches a strategy on behalf of a collection that cannot prove its owner on-chain.
      *
-     * @dev This skips no gate, because there is none to skip. What it does, and `launch` cannot,
-     * is name a recipient that is not the caller: a collection whose ownership was established
-     * off-chain can be launched on its behalf and paid from the first trade, which is the only
-     * reason this path exists.
+     * @dev Since decision 0009 this skips no gate, because there is none to skip. What it still
+     * does, and `launch` cannot, is name a recipient that is not the caller: a collection whose
+     * ownership was established off-chain can be launched on its behalf and paid from the first
+     * trade, which is the reference's `collectionOwner` argument and the only reason this survives.
      *
      * @dev Such a launch is never marked verified, and needs no special case to not be: we are not
      * the collection's owner, so the one rule `_launch` applies already answers. A zero recipient
@@ -343,10 +399,10 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * @dev `WrongLaunchFee` is exact in both directions. Under-paying is obvious; over-paying
      * matters because the surplus would sit in a contract with no way to return it.
      *
-     * @dev Nothing here refuses a collection that already has strategies. Two desks on one
-     * collection do compete for the same floor, and each purchase does make the next dearer for
-     * the other, but a one-per-collection rule would be worse: one slot per collection, taken by
-     * whoever transacted first, at 101 ms blocks with a public mempool.
+     * @dev Nothing here refuses a collection that already has strategies. Decision 0011 took that
+     * rule out: two desks on one collection do compete for the same floor, and each purchase does
+     * make the next dearer for the other, but the scarcity it created was worse — one slot per
+     * collection, taken by whoever transacted first, at 101 ms blocks with a public mempool.
      *
      * @dev `NotERC721` is the gate that matters most after ownership, because the failure it
      * prevents is silent and paid for. The strategy calls `ownerOf` and `transferFrom` on this
@@ -397,18 +453,22 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /**
      * @notice Launches a fungible strategy on `token`. Anyone may call this, for the fee.
      *
-     * @dev No owner's consent is asked for, and the reason is what a token is: a fungible token
-     * has, more often than not, renounced its owner and is nobody's to consent for. Anyone is
-     * admitted for the fee.
+     * @dev Decision 0005 does not apply here, and the reason is what a token is. A collection has
+     * an owner whose consent the strategy speaks for; a fungible token has, more often than not,
+     * renounced its owner and is nobody's to consent for. The reference's live factory admits
+     * anyone for the fee — checked by simulation, against what its documentation says — and so
+     * does this one, one strategy per token.
      *
      * @dev The creator tenth goes to the token's `owner()` when it has one, read the way the
      * collection owner is read, and is left unregistered otherwise, which the hook routes to the
-     * protocol. The launcher is never the recipient: if the launcher could name any address, the
-     * first person to launch on a popular token would collect a tenth of its fees forever, and
-     * that is a race worth not having.
+     * protocol. The launcher is never the recipient: the reference lets the launcher name any
+     * address, so the first person to launch on a popular token collects a tenth of its fees
+     * forever, and that is a race worth not having.
      *
      * @dev The bag is `totalSupply() / BAG_DIVISOR`, sized here and not by a front end; see the
-     * constant. Every other guard is on `_validateERC20Launch`, and explained there.
+     * constant. `TargetNotAdmitted` gates the token as `launch` gates a collection, for the same
+     * reason: a token's issuer can mint bags or shrink the desk's balance at will (decision 0018).
+     * Every other guard is on `_validateERC20Launch`, and explained there.
      */
     function launchERC20(
         address token,
@@ -417,6 +477,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         uint256 bidIncreasePerSecond,
         uint256 maxBid
     ) external payable nonReentrant returns (address) {
+        _assertAdmitted(token);
         ERC20Launch memory terms = ERC20Launch({
             token: token,
             bagSize: _totalSupply(token) / BAG_DIVISOR,
@@ -430,7 +491,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /**
      * @notice Launches a fungible strategy with an explicit bag and an explicit creator recipient.
      *
-     * @dev The team-launched path, for the factory owner only: a token whose right bag
+     * @dev The reference's team-launched path, for the factory owner only: a token whose right bag
      * is not a thousandth of its supply, or whose owner was established off-chain. Same fee, same
      * bounds, same everything else; `InvalidBag` refuses a bag of nothing, which could never be
      * sold, and a bag above the supply, which could never be bought.
@@ -485,7 +546,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * @notice Launches a strategy that sweeps nothing and pays its holders in itself. Anyone may
      * call this, for the fee.
      *
-     * @dev There is no target, so there is no owner whose consent could be asked for, and
+     * @dev There is no target, so there is no owner whose consent decision 0005 would ask for, and
      * nothing to record in the collection mappings: `strategyToCollection` stays zero, which is
      * what tells the hook that the creator recipient can never be re-pointed. The launcher is that
      * recipient, fixed here for good; unlike a fungible launch there is no popular token to race
@@ -538,7 +599,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      *
      * @dev The mappings are written first so `isStrategy` answers for the routers and
      * `strategyToCollection` for anything that needs to know what a strategy buys. There is no
-     * reverse mapping: a collection may carry any number of strategies, and a
+     * reverse mapping: since decision 0011 a collection may carry any number of strategies, and a
      * `collection => strategy` entry would answer one address for a one-to-many relation — a fact
      * that is wrong the moment a second launch lands. Whatever needs the strategies of a collection
      * reads them from the launch events. A launch with no target passes the zero address and is
@@ -587,7 +648,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * @notice Everything a fungible launch must be true about before anything is deployed.
      *
      * @dev `ERC20ImplementationNotSet` has the same shape as `HookNotSet`: nothing to clone.
-     * A token may carry any number of bag desks, as a collection may.
+     * A token may carry any number of bag desks, as a collection may since decision 0011.
      * `NotERC20` is the gate that matters most, because the
      * failure it prevents is silent and paid for: the strategy calls `transferFrom` and `transfer`
      * on this address for the rest of its life, and against something that is not a token it can
@@ -595,11 +656,16 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * is refused. `InvalidBag` refuses a bag of nothing, which could never be sold, and one above
      * the supply, which could never be brought. The bid bounds are the NFT launch's.
      *
-     * @dev `NotERC20` also refuses a collection and a Sweep token. `totalSupply()` is not proof of
-     * being fungible: every `ERC721Enumerable` and every ERC721A answers it, and a bag desk pointed
-     * at a collection is broken from birth. A Sweep token is refused for the same reason in a
-     * different dress: its transfer lock would refuse the desk delivery of every bag it ever paid
-     * for. Without this guard both launches would succeed and cost the launch fee to discover.
+     * @dev `NotERC20` also refuses a collection and a Sweep token, which is finding 2 of the
+     * pre-mainnet review of 22 September 2026. `totalSupply()` is not proof of being fungible:
+     * every `ERC721Enumerable` and every ERC721A answers it, so a stranger could take a
+     * collection's slot through this door — both launches shared one `collection => strategy`
+     * mapping — and lock its owner out of `launch` for good. Decision 0011 has since removed the
+     * slot itself, so that half of the harm is gone; a bag desk on a collection is still broken,
+     * which is why this stays. A Sweep token
+     * is refused for the same reason in a different dress: its transfer lock would refuse the
+     * desk delivery of every bag it ever paid for. Both were reachable before this line and both
+     * cost the launch fee to discover.
      */
     function _validateERC20Launch(ERC20Launch memory terms) private view {
         if (hook == address(0)) revert HookNotSet();
@@ -638,7 +704,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         config.bidIncreasePerSecond = terms.bidIncreasePerSecond;
         config.maxBid = terms.maxBid;
         config.resaleMultiplierBps = resaleMultiplierBps;
-        config.askDecayWindow = 0;
+        config.askDecayWindow = askDecayWindow;
         config.owner = owner();
         config.curve = curve;
 
@@ -650,7 +716,8 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     /// @dev The owner is this factory's, never `msg.sender`. Launching is permissionless precisely
     /// so that it grants nothing: the setters it would otherwise hand over — the bid ceiling, the
     /// distributor list — are power over a contract that will hold other people's money.
-    /// @dev The ask decay window is passed as zero: a fixed resale price.
+    /// @dev The ask decays over the factory's `askDecayWindow`, decision 0020, which supersedes
+    /// decision 0004's fixed resale price: a fixed ask stranded the live Hoodborn shelf.
     function _deployStrategy(
         address collection,
         string calldata name_,
@@ -669,7 +736,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         config.bidIncreasePerSecond = bidIncreasePerSecond;
         config.maxBid = maxBid;
         config.resaleMultiplierBps = resaleMultiplierBps;
-        config.askDecayWindow = 0;
+        config.askDecayWindow = askDecayWindow;
         config.owner = owner();
         config.curve = curve;
 
@@ -708,7 +775,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      *
      * @dev A burn router that may not swap is a burn router that does nothing, so the two are set
      * in one call rather than two with a silent failure between them. The listing is permanent
-     *: strategies born with this router can never follow it out of the list, so
+     * (decision 0015): strategies born with this router can never follow it out of the list, so
      * delisting it would freeze their burns for good.
      */
     function setBurnRouter(address router) external onlyOwner {
@@ -729,7 +796,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      *
      * @dev What this grants is the power to create ERC-6909 claims on a strategy's token, since a
      * router is the only way that token reaches the PoolManager at all. A router added here that
-     * took its output as claims would open an escape from the fee: claims move
+     * took its output as claims would reopen the escape the pre-mainnet review found: claims move
      * from wallet to wallet without touching the token, fund a hookless pool, and trade there
      * paying nothing forever. Add only a contract whose settlement you have read.
      *
@@ -744,9 +811,28 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     }
 
     /**
+     * @notice Lists or delists an address allowed to move any desk's bid within that desk's
+     * restorable highs (decision 0019).
+     *
+     * @dev `InvalidConfiguration` refuses the zero address, which could never be a caller and
+     * whose presence in the list would only ever be a mistake read back later as intent.
+     *
+     * @dev What a listing is worth to an attacker who takes the key: on every desk, the bid set
+     * anywhere from the absolute minimums up to the restorable highs its owner already put in
+     * force, or held down as a brake. Never a higher ceiling, never a fund movement, never another
+     * parameter — see `SweepStrategy.manageBid`. Delisting takes effect on the desk's next read,
+     * so revocation is one transaction with nothing to undo per desk.
+     */
+    function setBidManager(address manager, bool allowed) external onlyOwner {
+        if (manager == address(0)) revert InvalidConfiguration();
+        isBidManager[manager] = allowed;
+        emit BidManagerSet(manager, allowed);
+    }
+
+    /**
      * @notice Admits a router and freezes it in: it can never be delisted again, by anyone.
      *
-     * @dev One-way on purpose. The transfer lock makes the listed routers the
+     * @dev One-way on purpose (decision 0015). The transfer lock makes the listed routers the
      * only market this token has, so an owner who could empty the list — or an attacker holding
      * that owner's keys — could freeze every holder's exit in two transactions. The base swap
      * and burn routers are frozen at deploy; the price is that a permanent router with a bug can
@@ -829,6 +915,52 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
         emit ResaleMultiplierSet(multiplierBps);
     }
 
+    /**
+     * @notice Admits a target to the public launch paths, or withdraws it (decision 0018).
+     *
+     * @dev Withdrawing stops future launches on the target and touches nothing already launched:
+     * a strategy's collection is fixed at its birth. The zero address is refused because no
+     * launch can name it, so admitting it would record a decision about nothing.
+     */
+    function setLaunchTarget(address target, bool admitted) external onlyOwner {
+        if (target == address(0)) revert InvalidConfiguration();
+        isLaunchTarget[target] = admitted;
+        emit LaunchTargetSet(target, admitted);
+    }
+
+    /// @notice Opens the public launch paths to every target, as decision 0009 had them, or
+    /// curates them again (decision 0018).
+    function setOpenLaunches(bool open) external onlyOwner {
+        openLaunches = open;
+        emit OpenLaunchesSet(open);
+    }
+
+    /**
+     * @notice Retunes the ask decay window future desks launch with (decision 0020).
+     *
+     * @dev Future launches only: each desk keeps its window in its own storage, retuned through
+     * that desk's `setResaleTerms`, so this cannot reprice a shelf already stocked.
+     *
+     * @dev `InvalidConfiguration` refuses a non-zero window under `MIN_ASK_DECAY_WINDOW`, which
+     * would let every new desk's shelf be bought back at cost within hours, and one over
+     * `MAX_ASK_DECAY_WINDOW`, which would launch desks whose asks are fixed in all but name and
+     * strand their shelves as the Hoodborn desk's was. Zero stays allowed: it is decision 0004's
+     * fixed ask, a judgement the owner may return to, not a misconfiguration.
+     */
+    function setAskDecayWindow(uint256 window) external onlyOwner {
+        if (window != 0 && (window < MIN_ASK_DECAY_WINDOW || window > MAX_ASK_DECAY_WINDOW)) {
+            revert InvalidConfiguration();
+        }
+        askDecayWindow = window;
+        emit AskDecayWindowSet(window);
+    }
+
+    /// @notice Refuses a public launch on a target the owner has not admitted, unless launches
+    /// are open. Explained on `launch`.
+    function _assertAdmitted(address target) private view {
+        if (!openLaunches && !isLaunchTarget[target]) revert TargetNotAdmitted();
+    }
+
     /// @notice Clones the curve implementation for one launch. Initialisation happens in
     /// `_open`, after the strategy exists and the supply has moved, because the curve refuses to
     /// initialise over anything less than the whole supply.
@@ -852,7 +984,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * which makes the pool's opening price the curve's final spot price — and `assertSeedable`
      * re-proves the mint before anything irreversible. Everything from `completeGraduation` on
      * happens in this one transaction: a failed seed reverts the whole thing back onto the
-     * curve, solvent and retryable, which is why no rescue function exists. The
+     * curve, solvent and retryable, which is why no rescue function exists (decision 0014). The
      * excess is measured as this factory's remaining balance rather than recomputed, so mint
      * rounding dust burns with it instead of stranding here.
      */
@@ -880,7 +1012,7 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * @dev `loadingLiquidity` is raised for exactly the span of the multicall. It is the only
      * gate the hook has on pool creation and on deposits, so outside this window nobody can open
      * a Sweep pool and nobody can add a second position to one that exists — the same gate that
-     * guarded the launch-time load when pools were still created at launch.
+     * guarded the launch-time load before decision 0013 moved pool creation here.
      *
      * @dev The Permit2 approval is what lets the PositionManager pull the token side; solady's
      * ERC20 grants Permit2 itself an infinite allowance by default, and that is safe on a locked
@@ -921,10 +1053,10 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
      * ETH against the pool's token allocation, so the mint carries value and the action list
      * ends with a `SWEEP` of the native side — liquidity rounds down, and without the sweep the
      * unabsorbed wei would strand in the PositionManager. They go to the dead address, which
-     * accepts ETH unconditionally: sent to the launch fee recipient instead, a recipient that
-     * refuses ETH would turn one wei of dust into a revert of every graduation. Wei-scale, and
-     * disclosed. The token side's rounding remainder stays in the factory and is burnt by the
-     * caller.
+     * accepts ETH unconditionally: sent to the launch fee recipient, a recipient that refuses
+     * ETH turned one wei of dust into a revert of every graduation (audit 2026-10-02, L-1).
+     * Wei-scale, and disclosed. The token side's rounding remainder stays in the factory and is
+     * burnt by the caller.
      */
     function _graduationCalls(PoolKey memory key, uint160 sqrtPriceX96, uint256 ethAmount, uint256 tokenAmount)
         private

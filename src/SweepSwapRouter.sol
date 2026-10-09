@@ -92,7 +92,7 @@ contract SweepSwapRouter is IUnlockCallback {
      * the caller rather than to a contract with no way to give it back later. The refund is the
      * growth of the router's balance over this call's own `msg.value`, never the whole balance:
      * ETH force-sent here by `selfdestruct` would otherwise go to whoever bought next, a race
-     * only a bot wins.
+     * only a bot wins (finding 10 of the 22 September review).
      */
     function buy(address token, uint256 minOut, uint256 deadline) external payable returns (uint256 amountOut) {
         if (block.timestamp > deadline) revert Expired();

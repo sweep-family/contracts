@@ -6,8 +6,9 @@ pragma solidity ^0.8.26;
  * @author 0xDAVZER
  * @notice Constant-product quotes for the bonding curve, both directions.
  *
- * @dev No embedded-fee parameter: Sweep's curve always takes its fees outside the invariant, so
- * the quotes price the bare constant product. Rounding always
+ * @dev Adapted from `reference/pons/libraries/PonsV2BondingCurveMath.sol` with the embedded-fee
+ * parameter deleted: Sweep's curve always takes its fees outside the invariant, and Pons only
+ * kept the parameter for an internal buyback this protocol does not have. Rounding always
  * favours the reserves — `getAmountOut` floors what leaves, `getAmountIn` adds one to what must
  * arrive — so no sequence of trades can pull the invariant down.
  */

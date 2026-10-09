@@ -35,7 +35,7 @@ contract RejectsEth {
 /**
  * @title HookTest
  * @author 0xDAVZER
- * @notice Everything the toll booth must do, against a real PoolManager deployed in the
+ * @notice Brick 4. Everything the toll booth must do, against a real PoolManager deployed in the
  * test rather than a fork, so the whole suite runs in a second and can jump forward in time.
  *
  * @dev The hook is the first contract here that cannot be tested in isolation: its behaviour only
@@ -227,14 +227,16 @@ contract HookTest is Test {
     /*                              the fee curve                          */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Ten percent on a buy, from the first block of a strategy's life. There is one rate,
-    /// it is a constant, and nothing about the clock or the strategy changes it.
+    /// @notice Ten percent on a buy, from the first block of a strategy's life. Decision 0012
+    /// removed the launch ramp — the ninety-nine percent opening rate that shed a point a minute
+    /// for eighty-nine minutes — so there is one rate, it is a constant, and nothing about the
+    /// clock or the strategy changes it.
     function test_BuyFeeIsTenPercentFromTheFirstBlock() public view {
         assertEq(hook.FEE_BPS(), 1000);
     }
 
-    /// @notice And the same on a sell. The two sides do not differ at all, which is the honest
-    /// statement of a flat fee.
+    /// @notice And the same on a sell. There was never a ramp on this side; now the two sides do
+    /// not differ at all, which is the honest statement of a flat fee.
     function test_SellFeeIsTenPercentFromTheFirstBlock() public {
         _buy(1 ether);
         vm.recordLogs();
@@ -260,8 +262,9 @@ contract HookTest is Test {
     /*                                 swaps                               */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Every line after this guard assumes `amountSpecified < 0`. Banning exact output is
-    /// what lets the hook carry no branches for it, rather than code that can never run.
+    /// @notice Every line after this guard assumes `amountSpecified < 0`. The reference bans exact
+    /// output and then keeps branches handling it anyway; banning it here is what lets those
+    /// branches be deleted rather than carried as code that can never run.
     function test_ExactOutputSwapReverts() public {
         _expectHookRevert(IHooks.afterSwap.selector, SweepHook.ExactOutputNotAllowed.selector);
         vm.prank(trader);
@@ -331,8 +334,9 @@ contract HookTest is Test {
     }
 
     /// @notice What a first-block buyer gets is what every later buyer gets: nine tenths of the
-    /// pool's output. A flat fee funds the strategy from everyone equally, without a schedule that
-    /// only bots read to the minute.
+    /// pool's output. The launch ramp used to leave a sniper with one percent; decision 0012 took
+    /// the view that a flat fee funds the strategy just as surely, from everyone equally, without
+    /// a schedule that only bots read to the minute.
     function test_TheFirstBuyKeepsNineTenthsLikeAnyOther() public {
         uint256 treasuryBefore = strategy.treasury();
         _buy(1 ether);
@@ -345,13 +349,14 @@ contract HookTest is Test {
     }
 
     /* ------------------------------------------------------------------ */
-    /*                  the fee never leaves the manager                   */
+    /*             departure 1 — the fee never leaves the manager          */
     /* ------------------------------------------------------------------ */
 
-    /// @notice The hook nets the fee against the swap's deltas rather than taking it out of the
-    /// PoolManager as real tokens, so it never holds a token at all and no movement of its own has
-    /// to be authorised against the strategy's transfer lock. Asserted here as a balance, including
-    /// the ERC-6909 claim balance, so neither form of custody can hide.
+    /// @notice The reference takes the fee out of the PoolManager as real tokens and transfers them
+    /// straight back in to pay for its own swap. Both movements have to be authorised against the
+    /// strategy's transfer lock, which is where its hardest arithmetic comes from. Netting the two
+    /// deltas instead means the hook never holds a token at all — asserted here as a balance,
+    /// including the ERC-6909 claim balance, so neither form of custody can hide.
     function test_HookMovesNoTokensOfItsOwn() public {
         _buy(1 ether);
         _sell(100_000e18);
@@ -389,11 +394,11 @@ contract HookTest is Test {
     }
 
     /* ------------------------------------------------------------------ */
-    /*              the creator and protocol are paid by pull              */
+    /*             departure 2 — the creator and protocol are paid by pull */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Accrual, not transfer. Nothing calls out to a recipient in the middle of a swap, so
-    /// no recipient can make a trade revert or spend its gas.
+    /// @notice Accrual, not transfer. The reference hands each recipient a 100,000 gas stipend in
+    /// the middle of every swap, on an address a collection owner chose; nothing here calls out.
     function test_FeeSplitAccruesTheCreatorAndProtocolShares() public {
         _nameCreator(creator);
 
@@ -457,11 +462,11 @@ contract HookTest is Test {
     }
 
     /// @notice Registration is the factory's to do and nobody else's: it redirects a tenth of every
-    /// trade of a strategy the caller may not own. And it is the only writer there is: no
-    /// `claimCreatorFeeRecipient` exists that would let a collection's current `owner()` take a
+    /// trade of a strategy the caller may not own. And it is the only writer there is — decision
+    /// 0009 removed `claimCreatorFeeRecipient`, which let a collection's current `owner()` take a
     /// live revenue stream from the address that paid the launch fee and opened the market. The
-    /// call is asserted dead on the deployed hook, because an ABI that carries it is what a front
-    /// end would go on believing.
+    /// call is asserted dead rather than merely deleted from the source, because an ABI that still
+    /// carries it is what a front end would go on believing.
     function test_TheFactoryIsTheOnlyWriterOfTheCreatorRecipient() public {
         vm.prank(trader);
         vm.expectRevert(SweepHook.NotFactory.selector);
@@ -546,7 +551,8 @@ contract HookTest is Test {
     /* ------------------------------------------------------------------ */
 
     /// @dev Names where the creator tenth accrues, the only way there is to: through the factory,
-    /// once.
+    /// once. The tests that need a paid creator used to reach for `claimCreatorFeeRecipient`, which
+    /// decision 0009 removed with the launch gate.
     function _nameCreator(address recipient) internal {
         vm.prank(address(factory));
         hook.registerCreatorFeeRecipient(address(strategy), recipient);

@@ -72,7 +72,7 @@ contract SkimmingToken is ERC20 {
 /**
  * @title LyingToken
  * @notice Returns false from `transfer` instead of reverting, the way a few well-known tokens do.
- * An unchecked `transfer` on a sale would take the buyer's ETH and keep the bag.
+ * The reference's unchecked `transfer` on a sale would take the buyer's ETH and keep the bag.
  */
 contract LyingToken is ERC20 {
     function name() public pure override returns (string memory) {

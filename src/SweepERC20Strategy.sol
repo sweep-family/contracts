@@ -63,7 +63,7 @@ contract SweepERC20Strategy is SweepDesk {
     uint256 public bagsHeld;
 
     /// @notice The target tokens all held bags sum to — what the desk's balance must always
-    /// cover, checked after every external call that could have moved it.
+    /// cover, checked after every external call that could have moved it (decision 0015).
     uint256 public heldBagTokens;
 
     /// @notice What the protocol paid for each bag it holds, and when.
@@ -72,9 +72,13 @@ contract SweepERC20Strategy is SweepDesk {
     error NothingToSpend();
     error BagNotDelivered();
     error InvalidRange();
+    error PriceBelowMinimum();
+    error Expired();
+    error NoShortfall();
 
     event BagBought(uint256 indexed bagId, uint256 cost, address indexed seller, uint256 openingAsk);
     event BagSold(uint256 indexed bagId, uint256 price, address indexed buyer, uint256 cost);
+    event BagWrittenOff(uint256 indexed bagId, uint256 cost, address indexed caller);
 
     /**
      * @notice Wires a strategy to its target.
@@ -110,29 +114,64 @@ contract SweepERC20Strategy is SweepDesk {
     /**
      * @notice Sells one bag to the protocol, at the price it is publishing right now.
      *
-     * @dev Named from the desk's side: the desk buys tokens. The caller is the seller, must have
-     * approved a bag to this contract, and is paid `currentBid()` — the smallest of the ramp, the
-     * cap and the treasury — so the desk can never pay more than it holds or more than it has
-     * published. Permissionless and unrewarded: the seller is already
+     * @dev Named from the desk's side, as the reference names it: the desk buys tokens. The caller
+     * is the seller, must have approved a bag to this contract, and is paid `currentBid()` — the
+     * smallest of the ramp, the cap and the treasury — so the desk can never pay more than it
+     * holds or more than it has published. Permissionless and unrewarded: the seller is already
      * motivated by wanting the money.
      *
      * @dev `NothingToSpend` refuses a purchase at zero rather than making one. A bag bought for
      * nothing would be listed at nothing, and a zero ask is how "not held" is spelled, so the bag
-     * would sit on the shelf forever with no way to sell it.
+     * would sit on the shelf forever with no way to sell it. This is the reference's `NoZeroBuys`.
      *
      * @dev The bag is measured, not assumed: `BagNotDelivered` unless the balance rose by exactly
      * `bagSize`. A fee-on-transfer or rebasing token delivers less than was sent, and a desk that
      * did not check would resell a bag it does not fully hold.
      *
-     * @dev The seller is paid last and with `safeTransferETH`, not a forced variant:
+     * @dev The seller is paid last and with `safeTransferETH`, not the reference's forced variant:
      * a seller that cannot receive ETH gets a revert and keeps their bag, which is the honest
      * outcome; forcing the payment would strand it in a throwaway contract. The id is taken before
      * the transfer so a reverted purchase never burns one; `nonReentrant` keeps a receive hook on
      * the seller's side from selling a second bag inside the first sale's payment.
+     *
+     * @dev This form states no minimum and no deadline: it sells at whatever the bid is when it
+     * lands. It is the bounded form with both bounds open, kept so existing callers still work.
+     * A seller who cares what they receive uses `buyTokensBounded(minPrice, deadline)`.
      */
     function buyTokens() external nonReentrant returns (uint256 bagId) {
+        return _buyTokens(0, type(uint256).max);
+    }
+
+    /**
+     * @notice Sells one bag to the protocol, refusing anything below `minPrice` or after
+     * `deadline` (SC-05 of the 2 October audit).
+     *
+     * @dev The bid restarts from zero after every purchase, and the seller cannot see where it
+     * will stand when their transaction lands. Without a minimum, a seller whose sale lands a
+     * second or two after a rival's gives up a whole bag for that second of bid, and a bot can
+     * buy it straight back at the 1.2x ask. `PriceBelowMinimum` refuses such a sale and the
+     * seller keeps the bag. `Expired` refuses one that sat waiting, as the swap router's
+     * deadline does, so an offer made against yesterday's bid cannot execute today.
+     *
+     * @dev Named apart from `buyTokens()` rather than overloading it. An overload changes how
+     * tools address the existing call: go-ethereum renames one of the pair `buyTokens0`, and a
+     * typed client must disambiguate by arguments. A distinct name leaves every existing caller
+     * of `buyTokens()` and every generated binding exactly as it was.
+     */
+    function buyTokensBounded(uint256 minPrice, uint256 deadline) external nonReentrant returns (uint256 bagId) {
+        return _buyTokens(minPrice, deadline);
+    }
+
+    /**
+     * @dev The purchase both forms share. Every guard but the two bounds is explained on
+     * `buyTokens()`; the bounds are explained on `buyTokensBounded`. The bounds are
+     * read before anything moves, so a refused sale costs the seller only gas.
+     */
+    function _buyTokens(uint256 minPrice, uint256 deadline) private returns (uint256 bagId) {
+        if (block.timestamp > deadline) revert Expired();
         uint256 cost = currentBid();
         if (cost == 0) revert NothingToSpend();
+        if (cost < minPrice) revert PriceBelowMinimum();
 
         bagId = ++lastBagId;
 
@@ -154,26 +193,28 @@ contract SweepERC20Strategy is SweepDesk {
     /**
      * @notice Buys a held bag from the protocol at its current ask.
      *
-     * @dev The exact ask is required rather than at-least, so a buyer cannot overpay into a price
-     * the protocol never quoted. Because the ask may descend, the quote is only valid for the block
-     * it was read in — a caller sending yesterday's price will simply be refused.
+     * @dev The sale fills at the ask in force when it lands and refunds the rest (`_requireAsk`,
+     * `_refundExcess`): the protocol never takes more than it quotes, and a buyer whose read is a
+     * few seconds old, and so a little high, still buys. Below the ask is refused.
      *
      * @dev The move is checked: `safeTransfer` reverts on a token that returns false, and the
-     * revert takes the cleared entry and the queued proceeds with it. Unchecked, a lying token
-     * would take the buyer's ETH, keep the bag, and destroy the listing in one transaction. With
-     * the transfer checked and the function `nonReentrant`, the order of the clearing and the move
-     * is convention rather than a guard: swapping them changes no observable outcome.
+     * revert takes the cleared entry and the queued proceeds with it. The reference clears first
+     * and calls `transfer` unchecked, so a lying token would take the buyer's ETH, keep the bag,
+     * and destroy the listing in one transaction. With the transfer checked and the function
+     * `nonReentrant`, the order of the clearing and the move is convention rather than a guard:
+     * a mutation swapping them passes every test, which is the honest description of it.
      *
      * @dev A `true` return is not proof of delivery, so the buyer's balance is measured across
      * the send: `BagNotDelivered` unless it rose by at least `bagSize`, mirroring the buy side's
      * check. A target that reports success and moves nothing would otherwise take the buyer's
-     * ETH and clear the bag from the books. A target that lies on `balanceOf` too is beyond any
-     * on-chain guard.
+     * ETH and clear the bag from the books (finding 12 of the 22 September review). A target
+     * that lies on `balanceOf` too is beyond any on-chain guard.
      */
     function sellTokens(uint256 bagId) external payable nonReentrant {
         Holding memory holding = bags[bagId];
         if (holding.cost == 0) revert NotForSale();
-        if (msg.value != _askFor(holding)) revert WrongPayment();
+        uint256 ask = _askFor(holding);
+        _requireAsk(ask);
 
         delete bags[bagId];
         --bagsHeld;
@@ -182,14 +223,45 @@ contract SweepERC20Strategy is SweepDesk {
         SafeTransferLib.safeTransfer(address(token), msg.sender, bagSize);
         if (token.balanceOf(msg.sender) < before + bagSize) revert BagNotDelivered();
         _assertBagsIntact();
-        _recordSale(msg.value);
+        _recordSale(ask);
 
-        emit BagSold(bagId, msg.value, msg.sender, holding.cost);
+        emit BagSold(bagId, ask, msg.sender, holding.cost);
+        _refundExcess(ask);
+    }
+
+    /**
+     * @notice Strikes one bag from the books while the desk's balance no longer covers them, so
+     * the balance assertion stops refusing every purchase and every sale (decision 0017).
+     *
+     * @dev Exists because `_assertBagsIntact` cannot tell a balance drained during a call from one
+     * the target shrank on its own: a negative rebase, a slashing, an issuer's wipe. One wei of
+     * that refuses both paths for good, and the treasury behind them has no other spender. One bag
+     * per call, chosen by the caller, until the books are covered again: every bag is the same
+     * size, so which one goes changes only which cost basis the shelf keeps. Permissionless,
+     * because no ETH and no token moves.
+     *
+     * @dev `nonReentrant` is load-bearing for the same reason as on the NFT desk: a seller's or a
+     * buyer's transfer hook must not be able to write off the bags it is draining before the
+     * assertion of the call it is inside looks at the balance.
+     *
+     * @dev `NotForSale` refuses a bag that is not on the shelf. `NoShortfall` refuses while the
+     * balance still covers every bag, so nothing can be struck from a desk that is whole.
+     */
+    function writeOffBag(uint256 bagId) external nonReentrant {
+        Holding memory holding = bags[bagId];
+        if (holding.cost == 0) revert NotForSale();
+        if (token.balanceOf(address(this)) >= heldBagTokens) revert NoShortfall();
+
+        delete bags[bagId];
+        --bagsHeld;
+        heldBagTokens -= bagSize;
+
+        emit BagWrittenOff(bagId, holding.cost, msg.sender);
     }
 
     /**
      * @dev Proves the desk's balance still covers every bag it holds, after any external call
-     * that could have moved it. The per-purchase delta check counts what one
+     * that could have moved it (decision 0015). The per-purchase delta check counts what one
      * transferFrom delivered; it says nothing about a target token whose own transfer machinery
      * — a pre-approved operator, a DN404 twin, a callback on the seller's payment — can move
      * the desk's balance while control is outside. Without this, such a target empties the

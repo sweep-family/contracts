@@ -39,7 +39,7 @@ import {OwnerlessERC721} from "../mocks/OwnerlessERC721.sol";
  * @notice The whole protocol, deployed against the real Uniswap v4 on Robinhood Chain, for every
  * test that needs a pool to exist.
  *
- * @dev A fork rather than a locally deployed stack, deliberately. Everything past the hook that can
+ * @dev A fork rather than a locally deployed stack, deliberately. Everything past brick 4 that can
  * go wrong goes wrong inside somebody else's contract — the PositionManager's `multicall`, how it
  * pays, where Permit2 is — and a locally deployed copy would prove our encoding matches `lib/`,
  * which is not the question. The question is whether it matches the bytecode on the chain we ship
@@ -77,9 +77,15 @@ abstract contract SweepForkTest is Test {
     address internal whale = makeAddr("whale");
 
     uint256 internal constant LAUNCH_FEE = 0.001 ether;
+    /// @dev The mainnet curve economics, which every fork suite runs against.
+    uint256 internal constant PHANTOM_QUOTE = 1.68 ether;
+    uint256 internal constant GRADUATION_THRESHOLD = 4.2 ether;
     uint256 internal constant BID_PER_SECOND = 0.001 ether;
     uint256 internal constant MAX_BID = 5 ether;
 
+    /// @dev Opens launches to every target once the factory is wired. These suites test what a
+    /// launch does, not who may make one; curation (decision 0018) has its own suite,
+    /// `CuratedLaunch.t.sol`.
     function setUp() public virtual {
         string memory rpc = vm.envOr("ROBINHOOD_RPC_URL", string(""));
         if (bytes(rpc).length == 0) revert ArchiveRpcRequired();
@@ -96,7 +102,14 @@ abstract contract SweepForkTest is Test {
         collection = new SweepTestCollection("Sweep Test Apes", "STA", "");
 
         factory = new SweepNFTStrategyFactory(
-            positionManager, permit2, poolManager, address(new SweepNFTStrategy()), feeTo, address(this)
+            positionManager,
+            permit2,
+            poolManager,
+            address(new SweepNFTStrategy()),
+            feeTo,
+            address(this),
+            PHANTOM_QUOTE,
+            GRADUATION_THRESHOLD
         );
 
         bytes memory args = abi.encode(manager, ISweepFactory(address(factory)), feeTo);
@@ -113,8 +126,9 @@ abstract contract SweepForkTest is Test {
         sweepRouter = new SweepSwapRouter(manager, ISweepFactory(address(factory)));
         factory.setRouterPermanent(address(sweepRouter));
 
-        curveImplementation = new SweepBondingCurve();
+        curveImplementation = new SweepBondingCurve(PHANTOM_QUOTE, GRADUATION_THRESHOLD);
         factory.setCurveImplementation(address(curveImplementation));
+        factory.setOpenLaunches(true);
 
         vm.deal(launcher, 10 ether);
         vm.deal(trader, 100 ether);
@@ -129,7 +143,7 @@ abstract contract SweepForkTest is Test {
      * @dev A stranger buying `ethIn` of the token, which is what funds a treasury.
      *
      * This goes through the protocol's own `SweepSwapRouter` rather than v4's `PoolSwapTest`,
-     * and that is the whole point rather than a detail. The
+     * and that is the whole point rather than a detail. Since the review of 22 September 2026 the
      * hook refuses a swap whose caller the factory does not list, and the list is what keeps
      * ERC-6909 claims from existing — so a fixture that listed `PoolSwapTest`, which takes claims
      * on request, would be a fixture whose world is not the one we ship. `swapRouter` is still
@@ -156,7 +170,7 @@ abstract contract SweepForkTest is Test {
     }
 
     /// @dev One launch by the collection's owner, graduated to its pool, and the pool key it
-    /// produced. Most tests want the machine running, and the machine starts
+    /// produced. Most tests want the machine running, and since decision 0013 the machine starts
     /// at graduation, so the whole curve life happens inside this helper; a test about the curve
     /// phase itself uses `_launchOnCurve`.
     function _launch() internal returns (address strategy, PoolKey memory key) {

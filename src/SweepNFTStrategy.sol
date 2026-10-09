@@ -55,8 +55,8 @@ contract SweepNFTStrategy is SweepDesk {
     mapping(uint256 tokenId => Holding) public holdings;
 
     /// @dev Every piece on the shelf, enumerable so a purchase can prove afterwards that the
-    /// whole inventory survived the venue's call, and so the shelf can be surfaced at all — an
-    /// inventory kept only as a mapping is invisible to every market. `_heldIndexPlusOne` is the position
+    /// whole inventory survived the venue's call, and so the shelf can be surfaced at all — the
+    /// reference's inventory is invisible to every market. `_heldIndexPlusOne` is the position
     /// in `_heldIds` plus one, so zero means "not held" without an existence flag of its own.
     uint256[] private _heldIds;
     mapping(uint256 tokenId => uint256 indexPlusOne) private _heldIndexPlusOne;
@@ -69,11 +69,27 @@ contract SweepNFTStrategy is SweepDesk {
     error VenueFailed(bytes reason);
     error NothingToSpend();
     error DeliveryFailed();
+    error StillHeld();
+    error ProbeStarved();
+    error LostPieceNotWrittenOff();
+    error InventoryFull();
+
+    /// @notice Gas the write-off's `ownerOf` probe is given. An honest `ownerOf` costs a few
+    /// thousand; anything that needs more than this is treated as not answering.
+    uint256 public constant OWNERSHIP_PROBE_GAS = 100_000;
+
+    /// @notice Most pieces the shelf may hold; a purchase beyond it is refused (decision 0020).
+    /// @dev Every purchase walks the whole shelf (`_assertInventoryIntact`), about 5.5k gas a
+    /// piece cold. Unbounded, the 6 October 2026 mainnet fork put a purchase past the keeper's 20M
+    /// gas cap near 3,600 pieces, after which the desk could never buy again. At 500 the last
+    /// purchase allowed costs about 3M, measured in `DeskShelfBounds.t.sol`.
+    uint256 public constant MAX_INVENTORY = 500;
 
     event NFTPurchased(
         uint256 indexed tokenId, uint256 cost, address indexed venue, address indexed caller, uint256 openingAsk
     );
     event NFTSold(uint256 indexed tokenId, uint256 price, address indexed buyer, uint256 cost);
+    event PieceWrittenOff(uint256 indexed tokenId, uint256 cost, address indexed caller);
 
     /**
      * @notice Wires a strategy to its collection.
@@ -123,27 +139,45 @@ contract SweepNFTStrategy is SweepDesk {
      * both exist. And the cost is measured as a balance delta rather than assumed to be `value`, so
      * a venue returning change is credited honestly.
      *
-     * @dev The delta adds back whatever the treasury gained while the call was open. `addFees`
-     * raises the balance and the treasury together, so without it a venue that trades the
-     * strategy's own token before returning would have its fee counted twice: once as a credit,
-     * once as a smaller cost. The ledger would then outgrow the money held, and two such purchases
-     * with proceeds queued would leave `pendingBurn` above the balance and `processBurn` reverting
-     * for good. Reading `treasury` on both sides of the call makes `cost` what the venue kept, and
-     * nothing else.
+     * @dev The delta adds back whatever the treasury gained while the call was open, which is
+     * finding 3 of the pre-mainnet review of 22 September 2026. `addFees` raises the balance and
+     * the treasury together, so a venue that trades the strategy's own token before returning had
+     * its fee counted twice: once as a credit, once as a smaller cost. The ledger then outgrew the
+     * money held — 0.165 ETH booked against 0.083 actually there, on the fork — and two such
+     * purchases with proceeds queued left `pendingBurn` above the balance and `processBurn`
+     * reverting for good. Reading `treasury` on both sides of the call makes `cost` what the venue
+     * kept, and nothing else.
      *
-     * @dev `NothingToSpend` refuses a purchase that cost nothing, the same guard the bag desk
-     * carries. Without it a venue that delivers the piece and refunds the whole price would reset
-     * the bid ramp to zero and put a piece on the shelf that can never be sold, since a zero cost
-     * is how "not held" is spelled in `holdings`. Anyone holding a piece
+     * @dev `NothingToSpend` refuses a purchase that cost nothing, which is finding 4 of the same
+     * review and the guard the bag desk always had. A venue that delivers the piece and refunds
+     * the whole price reset the bid ramp to zero and put a piece on the shelf that can never be
+     * sold, since a zero cost is how "not held" is spelled in `holdings`. Anyone holding a piece
      * of the collection could do it at will and front-run a genuine seller into `BidExceeded`.
+     *
+     * @dev `LostPieceNotWrittenOff` refuses a piece that still has a shelf entry, which is A-1 of
+     * the audit of 4 October 2026. A piece can only have one while the desk does not own it if it
+     * left outside a sale (a seizure, a burn, an upgraded collection), which is what `writeOff`
+     * exists for. Bought back before that write-off, it got a second entry: the sale then removed
+     * one entry and cleared `holdings`, the other named a piece the desk no longer owned, every
+     * later purchase reverted `InventoryBreached`, and `writeOff` refused it as `NotForSale`, so
+     * the desk could not buy again until `retire`. Write the piece off first; it can then be
+     * bought back like any other.
+     *
+     * @dev `InventoryFull` refuses a purchase once the shelf holds `MAX_INVENTORY` pieces, and is
+     * read first so a full desk refuses before any ETH moves. Without it the inventory walk grows
+     * with every unsold piece until a purchase no longer fits any gas cap, and the desk can never
+     * buy again (the 6 October 2026 fork finding). It is a pause, not a death: a resale or a
+     * write-off frees a place, and the decaying ask is what brings the resale.
      */
     function buyTargetNFT(uint256 value, bytes calldata data, uint256 expectedId, address target)
         external
         nonReentrant
     {
+        if (_heldIds.length >= MAX_INVENTORY) revert InventoryFull();
         if (value > currentBid()) revert BidExceeded();
         if (target == address(collection)) revert TargetIsCollection();
         if (collection.ownerOf(expectedId) == address(this)) revert AlreadyOwned();
+        if (_heldIndexPlusOne[expectedId] != 0) revert LostPieceNotWrittenOff();
 
         uint256 ethBefore = address(this).balance;
         uint256 treasuryBefore = treasury;
@@ -169,28 +203,58 @@ contract SweepNFTStrategy is SweepDesk {
     /**
      * @notice Buys a held piece from the protocol at its current ask.
      *
-     * @dev The exact ask is required rather than at-least, so a buyer cannot overpay into a price
-     * the protocol never quoted. Because the ask descends, the quote is only valid for the block it
-     * was read in — a caller sending yesterday's price will simply be refused.
+     * @dev The sale fills at the ask in force when it lands and refunds the rest (`_requireAsk`,
+     * `_refundExcess`): the protocol never takes more than it quotes, and a buyer whose read is a
+     * few seconds old, and so a little high, still buys. Below the ask is refused.
      *
-     * @dev The transfer happens before the entry is cleared, and its result is checked by reading
-     * `ownerOf` afterwards. Clearing first with an unchecked `transferFrom` would let a collection
-     * that returns false rather than reverting take the buyer's ETH, keep the piece, and destroy
-     * the listing in a single transaction.
+     * @dev The transfer happens before the entry is cleared, and its result is checked. The
+     * reference clears first and calls `transferFrom` unchecked while using a safe wrapper
+     * everywhere else, so a collection that returns false rather than reverting would take the
+     * buyer's ETH, keep the piece, and destroy the listing in a single transaction.
      */
     function sellTargetNFT(uint256 tokenId) external payable nonReentrant {
         Holding memory holding = holdings[tokenId];
         if (holding.cost == 0) revert NotForSale();
-        if (msg.value != askPrice(tokenId)) revert WrongPayment();
+        uint256 ask = askPrice(tokenId);
+        _requireAsk(ask);
 
         collection.transferFrom(address(this), msg.sender, tokenId);
         if (collection.ownerOf(tokenId) != msg.sender) revert DeliveryFailed();
 
         delete holdings[tokenId];
         _removeHolding(tokenId);
-        _recordSale(msg.value);
+        _recordSale(ask);
 
-        emit NFTSold(tokenId, msg.value, msg.sender, holding.cost);
+        emit NFTSold(tokenId, ask, msg.sender, holding.cost);
+        _refundExcess(ask);
+    }
+
+    /**
+     * @notice Strikes from the shelf a piece the desk provably no longer holds, so the inventory
+     * assertion stops refusing every purchase over it (decision 0017).
+     *
+     * @dev Exists because `_assertInventoryIntact` cannot tell a piece lifted during a purchase
+     * from one the collection took away on its own: an admin burn, a seizure through an upgraded
+     * implementation, an expired name. Without it one such piece refuses every purchase for good,
+     * and the treasury behind it has no other spender. Permissionless, because no ETH moves and
+     * the only thing it can remove is an entry the collection itself says is not the desk's.
+     *
+     * @dev `nonReentrant` is load-bearing. The inventory assertion exists to catch a venue that
+     * lifts a held piece inside `buyTargetNFT`; were this callable from inside that call, the
+     * venue could write the lifted piece off before the assertion looked for it.
+     *
+     * @dev `NotForSale` refuses an id that is not on the shelf. `StillHeld` refuses a piece the
+     * collection still names the desk as owner of, whoever asks.
+     */
+    function writeOff(uint256 tokenId) external nonReentrant {
+        Holding memory holding = holdings[tokenId];
+        if (holding.cost == 0) revert NotForSale();
+        if (_stillHolds(tokenId)) revert StillHeld();
+
+        delete holdings[tokenId];
+        _removeHolding(tokenId);
+
+        emit PieceWrittenOff(tokenId, holding.cost, msg.sender);
     }
 
     /// @notice Pieces currently on the shelf.
@@ -212,19 +276,48 @@ contract SweepNFTStrategy is SweepDesk {
 
     /**
      * @dev Proves the desk still owns every piece it held before a venue's arbitrary call
-     *. The existing delivery checks count and identify what arrived; they say
+     * (decision 0015). The existing delivery checks count and identify what arrived; they say
      * nothing about what left. A collection with a pre-approved marketplace operator, or a
      * DN404-style token whose transfers move its NFTs, lets a crafted order deliver the expected
      * piece while lifting a held one — net count still plus one, expected piece still owned,
      * every old check green. Without this walk, that order sells the desk's best piece back to
-     * the attacker for nothing. Linear in inventory, on a chain where gas is cheap; the walk
-     * runs before the new piece is booked so it covers exactly the pieces the desk owned when
-     * the call went out.
+     * the attacker for nothing. Linear in inventory, which is why the shelf is capped at
+     * `MAX_INVENTORY`; the walk runs before the new piece is booked so it covers exactly the
+     * pieces the desk owned when the call went out.
      */
     function _assertInventoryIntact() private view {
         uint256 count = _heldIds.length;
         for (uint256 i = 0; i < count; ++i) {
             if (collection.ownerOf(_heldIds[i]) != address(this)) revert InventoryBreached();
+        }
+    }
+
+    /**
+     * @dev Asks the collection whether the desk still owns `tokenId`, inside a fixed gas budget,
+     * reading at most one word of its answer. Anything but a clean word naming this desk counts
+     * as not held: a revert, an empty or short answer, another address, or an `ownerOf` that
+     * burns the whole budget.
+     *
+     * @dev `ProbeStarved` is what makes "reverted" trustworthy. A call is given at most 63/64 of
+     * the gas left, so a caller sending just too little could starve an honest `ownerOf` into
+     * failing and have a piece the desk still owns written off. Refusing to probe on less than
+     * the budget needs, plus room to finish, means a failed probe is the collection's doing,
+     * never the caller's.
+     *
+     * @dev The call is made in assembly so only the first word of return data is copied. A
+     * high-level call copies all of it, and a collection returning megabytes could make every
+     * write-off on it run out of gas.
+     */
+    function _stillHolds(uint256 tokenId) private view returns (bool held) {
+        if (gasleft() < OWNERSHIP_PROBE_GAS + OWNERSHIP_PROBE_GAS / 63 + 10_000) revert ProbeStarved();
+        address target = address(collection);
+        uint256 budget = OWNERSHIP_PROBE_GAS;
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x6352211e00000000000000000000000000000000000000000000000000000000)
+            mstore(add(ptr, 0x04), tokenId)
+            let ok := staticcall(budget, target, ptr, 0x24, ptr, 0x20)
+            held := and(and(ok, gt(returndatasize(), 0x1f)), eq(mload(ptr), address()))
         }
     }
 

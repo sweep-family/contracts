@@ -57,7 +57,7 @@ contract OperatorCollection {
  * piece it was paid for and keeps the ETH, like any marketplace. In its thieving mode it
  * delivers TWO junk pieces — so the desk's balance check reads net plus one — including the
  * expected one, and uses the collection's global operator right to lift a piece the desk
- * already held. Every delivery guard passes: count up by one, expected piece owned. Only the
+ * already held. Every pre-0015 guard passes: count up by one, expected piece owned. Only the
  * inventory walk catches the lifted piece.
  */
 contract OperatorThiefMarketplace {

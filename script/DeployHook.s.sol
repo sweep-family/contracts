@@ -24,7 +24,7 @@ import {UniswapV4Addresses} from "./config/UniswapV4Addresses.sol";
  * @dev Foundry routes a salted `new` inside a broadcast through the canonical CREATE2 proxy at
  * `0x4e59b44847b379578588920cA78FbF26c0B4956C`, which is why the search uses that as the deployer
  * rather than the sender. Its presence on Robinhood Chain was verified on-chain before this design
- * was committed to.
+ * was committed to — see `docs/decisions/0003`.
  *
  * @dev The printed salt is a deployment artefact and belongs in the environment's record. Anyone
  * can rerun this and confirm it, because the same initcode and the same arguments produce the same

@@ -19,6 +19,12 @@ cbor_metadata = false
 
 fs_permissions = [{ access = "read", path = "./out" }]
 
+# Gas each test may spend, far above forge's default of 2^30. DeskShelfBounds fills a shelf to its
+# 500-piece cap through real purchases: about 829M gas optimised, and past 2^30 under `forge
+# coverage`, which builds without the optimizer and instruments every statement. The limit bounds
+# the test transaction only; the purchase budget that test pins is measured with gasleft().
+gas_limit = 17_179_869_184
+
 [profile.default.fuzz]
 runs = 512
 

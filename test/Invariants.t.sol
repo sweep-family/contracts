@@ -171,15 +171,15 @@ contract DeskHandler is Test {
  * @notice What must hold on an NFT desk after any sequence of trades, sweeps, resales, burns and
  * claims, against the real Uniswap v4 on Robinhood Chain.
  *
- * @dev The strategy is launched and the fuzzer starts trading at once: the fee is flat, so there
- * is no ramp to be inside of, and what the clock moves is the bid. Only the
+ * @dev The strategy is launched and the fuzzer starts trading at once: the fee is flat since
+ * decision 0012, so there is no ramp to be inside of, and what the clock moves is the bid. Only the
  * handler is a target: the invariants below are statements about the contracts, and a fuzzer
  * calling the contracts directly would mostly revert on guards other suites already pin.
  *
  * @dev The budget is set here rather than in foundry.toml because every call runs against a fork:
  * the default 256 runs of 64 calls took about 45 minutes, which no CI job should carry. Eight runs
- * of 40 calls reach every action (about 90 s) and are enough to catch a burn that under-decrements
- * `pendingBurn` or a fee ledger one wei too generous. Before a
+ * of 40 calls reach every action (about 90 s) and caught both mutations tried on 2026-09-22, a
+ * burn that under-decremented `pendingBurn` and a fee ledger one wei too generous. Before a
  * release, run it deep with `FOUNDRY_PROFILE=intense`: 64 runs of 64 calls, about 11 minutes,
  * rather than the profile's 2,000 runs of 256, which on a fork would take the better part of a day.
  */

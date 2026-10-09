@@ -64,7 +64,7 @@ contract StrategyHarness is SweepStrategy {
 
     /// @notice Hands tokens to a test account as setup, outside the lock.
     /// @dev A fixture seam, not a transfer under test: the PoolManager stand-in needs a balance
-    /// before a test can exercise the allowance, and since a distributor's send into
+    /// before a test can exercise the allowance, and since audit H-1 a distributor's send into
     /// the PoolManager is a pool leg like any other, so the deployer can no longer seed it with a
     /// plain transfer.
     function exposed_credit(address to, uint256 amount) external {

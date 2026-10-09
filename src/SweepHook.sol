@@ -58,10 +58,11 @@ contract SweepHook is BaseHook {
      * @notice What every swap pays, in either direction, from the first block of a pool's life.
      *
      * @dev One rate, one constant, and public so the interface reads it rather than assuming it.
-     * The rate is flat rather than a decaying launch schedule: a schedule is read to the minute by
-     * bots and by nobody else, which makes the first hour of every launch a market for the snipers
-     * it was meant to keep out. A flat rate funds the strategy from everyone equally and gives a
-     * first-block buyer the same deal as the last.
+     * The reference opens buys at ninety-nine percent and sheds a point a minute for eighty-nine
+     * minutes, an anti-sniper ramp this hook carried until decision 0012 removed it: a schedule
+     * read to the minute by bots and by nobody else, which made the first hour and a half of every
+     * launch a market for the people the ramp was meant to keep out. A flat rate funds the strategy
+     * from everyone equally and gives a first-block buyer the same deal as the last.
      */
     uint256 public constant FEE_BPS = 1000;
 
@@ -87,7 +88,7 @@ contract SweepHook is BaseHook {
     mapping(address strategy => address recipient) public creatorFeeRecipient;
 
     /// @notice ETH owed to each recipient, waiting to be pulled.
-    /// @dev Pulled rather than pushed. Pushing would send ETH to two arbitrary addresses in the
+    /// @dev Pulled rather than pushed. The reference sends ETH to two arbitrary addresses in the
     /// middle of every swap, with a gas stipend large enough to call back into the PoolManager, on
     /// a contract a collection owner chose. Accruing removes the untrusted call from the hot path
     /// of every trade in the system.
@@ -169,7 +170,7 @@ contract SweepHook is BaseHook {
      * already written in `accruedFees`, so the caller decides nothing except to pay the gas. That
      * is what lets a keeper with a privilege-less key do the paying for every recipient at once,
      * and what lets a recipient still pull by hand if the keeper is down. This is not a push in
-     * the swap path — the hook's reason for accruing at all — it is a pull that somebody else may
+     * the swap path — brick 4's reason for accruing at all — it is a pull that somebody else may
      * trigger.
      *
      * @dev Zeroed before the transfer, so a recipient that calls back in finds nothing left to
@@ -192,10 +193,11 @@ contract SweepHook is BaseHook {
     /**
      * @notice Names where a strategy's creator share accrues, at the moment it is launched.
      *
-     * @dev Factory-only, and final. This is the only writer of `creatorFeeRecipient` there is, and
-     * a collection's current `owner()` cannot re-point it: a stream taken by whoever holds an
-     * `owner()` today is taken from whoever paid the launch fee and opened the market. Who launches
-     * is paid, and the collection's ownership decides a badge on the launch event instead.
+     * @dev Factory-only, and final. This is the only writer of `creatorFeeRecipient` there is:
+     * decision 0009 removed the claim that let a collection's current `owner()` re-point it, on
+     * the ground that a stream taken by whoever holds an `owner()` today is taken from whoever
+     * paid the launch fee and opened the market. Who launches is paid, and the collection's
+     * ownership decides a badge on the launch event instead.
      *
      * @dev `NotFactory` is the whole guard. Anyone else calling this would be redirecting a tenth
      * of every trade of a strategy they do not own, for good.
@@ -268,14 +270,16 @@ contract SweepHook is BaseHook {
      * @notice Takes the fee on a swap, converts it to ETH, and splits it.
      *
      * @dev `ExactOutputNotAllowed` is the guard everything below depends on. With it, the
-     * question of which side pays the fee collapses to `zeroForOne` — buys pay their fee in
-     * tokens, sells pay it in ETH — and no branch exists for exact-output swaps, which cannot run.
+     * reference's `amountSpecified < 0 == zeroForOne` puzzle collapses to `zeroForOne` — buys pay
+     * their fee in tokens, sells pay it in ETH — and the branches the reference kept for a case it
+     * had already banned disappear rather than sitting in the contract as code that cannot run.
      *
-     * @dev `RouterNotAllowed` is what keeps the fee from being optional; without it there is a way
-     * around everything else. The token's transfer lock sees ERC-20 movements only; v4 also keeps
-     * ERC-6909 claim balances, and a swapper who takes its output as claims holds a balance the
-     * lock never sees, moves it between wallets through the PoolManager, funds a hookless pool with
-     * it and trades there for nothing, forever. Claims can only be minted from a delta on the PoolManager, and a locked
+     * @dev `RouterNotAllowed` is what keeps the fee from being optional, and it was added after
+     * the pre-mainnet review of 22 September 2026 found the way around everything else. The
+     * token's transfer lock sees ERC-20 movements only; v4 also keeps ERC-6909 claim balances,
+     * and a swapper who takes its output as claims holds a balance the lock never sees, moves it
+     * between wallets through the PoolManager, funds a hookless pool with it and trades there for
+     * nothing, forever. Claims can only be minted from a delta on the PoolManager, and a locked
      * token only reaches the PoolManager through a swap on this pool — so gating that swap on the
      * factory's list of routers, every one of which settles in ERC-20 and consumes the transient
      * allowance exactly, means no such delta is ever left and no claim can come into existence.
@@ -367,9 +371,9 @@ contract SweepHook is BaseHook {
      *
      * @dev The hook is credited its fee by the PoolManager after `afterSwap` returns, and debited
      * here by its own swap. Both land on the same `(address, currency)` running balance, so they
-     * cancel and **no token ever moves**. Taking the fee out as real ERC-20 and transferring it
-     * straight back in would be a round trip whose two legs both have to be authorised against the
-     * strategy's transfer lock, with all the arithmetic that implies.
+     * cancel and **no token ever moves**. The reference instead takes the fee out as real ERC-20 and
+     * transfers it straight back in — a round trip whose two legs both have to be authorised against
+     * the strategy's transfer lock, which is where its hardest arithmetic comes from.
      *
      * @dev This swap pays no fee of its own. `Hooks.afterSwap` returns early when the hook is the
      * caller, so it does not recurse.
@@ -404,9 +408,10 @@ contract SweepHook is BaseHook {
     /**
      * @notice Splits a collected fee eighty / ten / ten.
      *
-     * @dev Eighty percent buys NFTs, ten is the collection's, ten is the protocol's. The
-     * collection's tenth is what the protocol actually has to offer a collection in exchange for
-     * launching with it.
+     * @dev Eighty percent buys NFTs, ten is the collection's, ten is the protocol's. The reference's
+     * middle tenth bought and burnt its own ecosystem token; that mechanism is gone and the share
+     * goes to the collection instead, because that is the thing we actually have to offer a
+     * collection in exchange for launching with us.
      *
      * @dev An unclaimed creator share is added to the protocol's rather than accrued to the zero
      * address, where it would be permanently stranded. That is also what lets a strategy launch and

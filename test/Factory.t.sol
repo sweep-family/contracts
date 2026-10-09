@@ -30,7 +30,7 @@ import {RejectingSink} from "./mocks/CurveTestActors.sol";
 /**
  * @title FactoryTest
  * @author 0xDAVZER
- * @notice The factory, against the real Uniswap v4 on Robinhood Chain. The fixture is `SweepForkTest`.
+ * @notice Brick 5, against the real Uniswap v4 on Robinhood Chain. The fixture is `SweepForkTest`.
  */
 contract FactoryTest is SweepForkTest {
     using PoolIdLibrary for PoolKey;
@@ -50,7 +50,7 @@ contract FactoryTest is SweepForkTest {
 
     /// @notice A launch creates a market, not a pool: the whole supply lands on the strategy's
     /// own bonding curve, both directions of the mapping are recorded, and no v4 pool exists in
-    /// any form until graduation.
+    /// any form until graduation (decision 0013).
     function test_LaunchMovesTheWholeSupplyToTheCurveAndNoPoolExists() public {
         (address strategy, SweepBondingCurve curve) = _launchOnCurve();
         SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
@@ -68,13 +68,17 @@ contract FactoryTest is SweepForkTest {
     /// @notice The graduated pool opens at the curve's exact final spot price — the split
     /// `tokenOut · ethOut / (ethOut + P)` is what makes the two prices the same number, and this
     /// is the assertion that says the chart never jumps across graduation.
+    ///
+    /// @dev `ethOut` is `realQuoteReserve()`, what `completeGraduation` hands over. Until
+    /// 2026-10-05 graduation swept the fees first and `trackedQuote` was the same number; it now
+    /// still holds the fees owed at graduation, which never enter the pool.
     function test_GraduatedPoolOpensAtTheCurvesFinalPrice() public {
         (address strategy, SweepBondingCurve curve) = _launchOnCurve();
         vm.warp(block.timestamp + 5);
         vm.prank(whale);
         curve.buy{value: 20 ether}(0, whale);
 
-        uint256 ethOut = curve.trackedQuote();
+        uint256 ethOut = curve.realQuoteReserve();
         uint256 tokenOut = curve.trackedTokens();
         uint256 poolTokens = FixedPointMathLib.fullMulDiv(tokenOut, ethOut, ethOut + factory.PHANTOM_QUOTE());
 
@@ -116,7 +120,7 @@ contract FactoryTest is SweepForkTest {
     /// @notice A launch fee recipient that refuses ETH cannot hold graduations hostage. The
     /// native rounding remainder of the seed goes to the dead address, which always accepts it;
     /// sent to the fee recipient, a single wei of dust would revert every `createGraduatedPool`
-    /// until the owner changed the recipient.
+    /// until the owner changed the recipient (audit 2026-10-02, L-1).
     function test_ARejectingLaunchFeeRecipientCannotBlockGraduation() public {
         (address strategy,) = _launchOnCurve();
         RejectingSink sink = new RejectingSink();
@@ -197,7 +201,7 @@ contract FactoryTest is SweepForkTest {
 
     /// @notice The base swap and burn routers can never be delisted, by anyone: with a
     /// transfer-locked token they are the only market, so an owner who could empty the list
-    /// could freeze every holder's exit. An ordinary router still can be.
+    /// could freeze every holder's exit (decision 0015). An ordinary router still can be.
     function test_PermanentRoutersCannotBeDelisted() public {
         assertTrue(factory.isPermanentRouter(address(sweepRouter)));
         assertTrue(factory.isPermanentRouter(address(burnRouter)));
@@ -229,7 +233,7 @@ contract FactoryTest is SweepForkTest {
         vm.expectRevert(SweepNFTStrategyFactory.CurveEconomicsMismatch.selector);
         factory.setCurveImplementation(wrong);
 
-        address right = address(new SweepBondingCurve());
+        address right = address(new SweepBondingCurve(PHANTOM_QUOTE, GRADUATION_THRESHOLD));
         factory.setCurveImplementation(right);
     }
 
@@ -247,7 +251,7 @@ contract FactoryTest is SweepForkTest {
     }
 
     /// @notice A launch records what the strategy buys, and the routers record that it exists.
-    /// @dev There is no reverse mapping: a collection may carry any number of
+    /// @dev There is no reverse mapping since decision 0011: a collection may carry any number of
     /// strategies, so `collection => strategy` could only ever answer for one of them. What needs
     /// the strategies of a collection reads the launch events.
     function test_LaunchRecordsWhatTheStrategyBuys() public {
@@ -271,13 +275,14 @@ contract FactoryTest is SweepForkTest {
     }
 
     /**
-     * @notice A collection may carry as many strategies as anyone cares to launch. Each is its own
-     * token, its own treasury and its own shelf; they share only the collection they buy from.
+     * @notice A collection may carry as many strategies as anyone cares to launch, which is
+     * decision 0011. Each is its own token, its own treasury and its own shelf; they share only the
+     * collection they buy from.
      *
-     * @dev They do compete, and that cost is taken on knowingly: two desks publish a climbing bid
-     * on the same floor and each purchase makes the next one dearer for the other. What it buys is
-     * that there is no slot: nobody is locked out of a collection, so there is nothing to race for
-     * and a stranger's launch takes nothing away from the collection itself.
+     * @dev They do compete, and that is the cost the decision takes on knowingly: two desks publish
+     * a climbing bid on the same floor and each purchase makes the next one dearer for the other.
+     * What it buys is the end of the slot: nobody is locked out of a collection any more, so there
+     * is nothing to race for and a stranger's launch takes nothing away from the collection itself.
      */
     function test_ACollectionMayCarryManyStrategies() public {
         (address first,) = _launch();
@@ -361,9 +366,12 @@ contract FactoryTest is SweepForkTest {
             address(manager),
             address(new SweepNFTStrategy()),
             feeTo,
-            address(this)
+            address(this),
+            PHANTOM_QUOTE,
+            GRADUATION_THRESHOLD
         );
         fresh.setBurnRouter(address(burnRouter));
+        fresh.setOpenLaunches(true);
 
         vm.prank(launcher);
         vm.expectRevert(SweepNFTStrategyFactory.HookNotSet.selector);
@@ -415,7 +423,7 @@ contract FactoryTest is SweepForkTest {
 
     /// @notice Everything at once, on the real chain: a pool that did not exist a moment ago takes
     /// a stranger's ETH, the hook skims it, and the strategy's treasury can now bid for an NFT.
-    /// This is the assertion everything below the factory was built for.
+    /// This is the assertion the previous four bricks were built for.
     function test_TheLaunchedPoolCanBeTradedAndFundsTheTreasury() public {
         (address strategy, PoolKey memory key) = _launch();
         SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
@@ -437,10 +445,10 @@ contract FactoryTest is SweepForkTest {
     /*                  who may launch, and who is vouched for             */
     /* ------------------------------------------------------------------ */
 
-    /// @notice Anyone launches, on any collection. An owner gate would exclude every collection
-    /// whose `owner()` is renounced, cold or lost — which is most of the ones worth sweeping — and
-    /// would not be the protection it looks like, since ownership of a collection says nothing
-    /// about who should run a desk on it. What a launcher gets is the creator share
+    /// @notice Anyone launches, on any collection. Decision 0009 took the owner gate out: it
+    /// excluded every collection whose `owner()` is renounced, cold or lost — which is most of the
+    /// ones worth sweeping — and it never was the protection it looked like, since `launchERC20`
+    /// already admitted an ERC-721 through the same door. What a launcher gets is the creator share
     /// and the name. What a launcher does not get, unless the collection says so, is the badge.
     function test_AnyoneCanLaunchOnACollectionTheyDoNotOwn() public {
         vm.prank(trader);
@@ -488,7 +496,7 @@ contract FactoryTest is SweepForkTest {
     /// @notice The badge is dated, not current. A collection that changes hands after a launch takes
     /// nothing with it and gains nothing: the new owner does not inherit the badge, and cannot take
     /// the creator share from the launcher either. There is no on-chain path from owning a
-    /// collection to its strategy, which is why no owner claim exists.
+    /// collection to its strategy, which is decision 0009's second half and why the claim is gone.
     function test_ACollectionSoldAfterLaunchKeepsItsBadgeAndItsRecipient() public {
         (address strategy,) = _launch();
 
@@ -528,8 +536,8 @@ contract FactoryTest is SweepForkTest {
         assertFalse(_launchWasVerified(), "ownerLaunch vouched for itself");
     }
 
-    /// @notice `ownerLaunch` is `onlyOwner`, and that is the only thing it is: it skips no gate,
-    /// because there is no gate. Also: the same fee applies to us.
+    /// @notice `ownerLaunch` is `onlyOwner`, which is now the only thing it is: it no longer skips a
+    /// gate, because there is no gate. Also: the same fee applies to us.
     function test_OwnerLaunchIsOnlyForTheFactoryOwnerAndStillChargesTheFee() public {
         vm.prank(trader);
         vm.expectRevert(Ownable.Unauthorized.selector);
@@ -540,8 +548,9 @@ contract FactoryTest is SweepForkTest {
     }
 
     /// @notice The collection is paid from its first trade with nothing further to sign. The
-    /// launcher is registered with the hook inside the launch, rather than in a second transaction
-    /// the collection would have to know to send.
+    /// launcher is registered with the hook inside the launch, which is what the reference does with
+    /// `adminUpdateFeeAddress` and what the first draft here left as a second transaction the
+    /// collection had to know to send.
     function test_LaunchRegistersTheLauncherAsTheCreatorFeeRecipient() public {
         (address strategy, PoolKey memory key) = _launch();
         assertEq(hook.creatorFeeRecipient(strategy), launcher, "the launcher was not registered");
@@ -562,8 +571,8 @@ contract FactoryTest is SweepForkTest {
         assertEq(hook.creatorFeeRecipient(strategy), address(0));
     }
 
-    /// @notice The recipient is written once, by the factory, and has no second writer. There is no
-    /// `claimCreatorFeeRecipient`: a claim that redirects a live revenue
+    /// @notice The recipient is written once, by the factory, and has no second writer. Decision
+    /// 0009 removed `claimCreatorFeeRecipient` with the gate: a claim that redirects a live revenue
     /// stream on the strength of `owner()` is the same attack surface whichever way it points, and
     /// the stream it would have taken belongs to whoever paid the fee and opened the market.
     function test_TheCreatorRecipientHasNoSecondWriter() public {
@@ -665,22 +674,34 @@ contract FactoryTest is SweepForkTest {
         address impl = factory.strategyImplementation();
 
         vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
-        new SweepNFTStrategyFactory(address(0), p2, address(manager), impl, feeTo, address(this));
+        new SweepNFTStrategyFactory(
+            address(0), p2, address(manager), impl, feeTo, address(this), PHANTOM_QUOTE, GRADUATION_THRESHOLD
+        );
 
         vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
-        new SweepNFTStrategyFactory(posm, address(0), address(manager), impl, feeTo, address(this));
+        new SweepNFTStrategyFactory(
+            posm, address(0), address(manager), impl, feeTo, address(this), PHANTOM_QUOTE, GRADUATION_THRESHOLD
+        );
 
         vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
-        new SweepNFTStrategyFactory(posm, p2, address(0), impl, feeTo, address(this));
+        new SweepNFTStrategyFactory(
+            posm, p2, address(0), impl, feeTo, address(this), PHANTOM_QUOTE, GRADUATION_THRESHOLD
+        );
 
         vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
-        new SweepNFTStrategyFactory(posm, p2, address(manager), address(0), feeTo, address(this));
+        new SweepNFTStrategyFactory(
+            posm, p2, address(manager), address(0), feeTo, address(this), PHANTOM_QUOTE, GRADUATION_THRESHOLD
+        );
 
         vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
-        new SweepNFTStrategyFactory(posm, p2, address(manager), impl, address(0), address(this));
+        new SweepNFTStrategyFactory(
+            posm, p2, address(manager), impl, address(0), address(this), PHANTOM_QUOTE, GRADUATION_THRESHOLD
+        );
 
         vm.expectRevert(SweepNFTStrategyFactory.InvalidConfiguration.selector);
-        new SweepNFTStrategyFactory(posm, p2, address(manager), impl, feeTo, address(0));
+        new SweepNFTStrategyFactory(
+            posm, p2, address(manager), impl, feeTo, address(0), PHANTOM_QUOTE, GRADUATION_THRESHOLD
+        );
     }
 
     /// @notice Only the owner may retune anything. Launching is permissionless; steering is not.

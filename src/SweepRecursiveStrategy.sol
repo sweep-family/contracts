@@ -59,6 +59,11 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
     /// thousand ETH would freeze the ledger while leaving the mechanism nominally in place.
     uint256 public constant MAX_REWARD_MIN = 1 ether;
 
+    /// @notice Shortest gap between two distributions, the burn's own pace.
+    /// @dev Each distribution is bounded by the pool's depth, and without a gap one transaction
+    /// could chain bounded distributions into one unbounded buy and sandwich the sum.
+    uint256 public constant DISTRIBUTE_COOLDOWN = 12;
+
     /// @notice Where the buyback's ETH is turned into this token.
     address public burnRouter;
 
@@ -99,6 +104,7 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
     mapping(address account => bool excluded) public excludedFromRewards;
 
     error NothingToDistribute();
+    error DistributeCooldownNotElapsed();
     error Excluded();
     error RouterNotListed();
 
@@ -140,11 +146,21 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
     }
 
     /**
-     * @notice Spends every pending wei on buying the token back, and owes what was bought to the
-     * holders in proportion to their balances.
+     * @notice Spends pending fees on buying the token back, and owes what was bought to the holders
+     * in proportion to their balances.
      *
      * @dev Permissionless: the keeper calls it on the hour, anyone else may call it sooner.
-     * `NothingToDistribute` below `rewardMin` keeps the hour from buying dust.
+     * `NothingToDistribute` while `pendingRewards` is below `rewardMin` keeps a pass from buying
+     * dust, and again when the depth bound leaves nothing to spend. The minimum gates the queue,
+     * not the bounded pass: compared against the pass, any minimum above `maxBurnBuy` (4% of the
+     * pool's ETH, about 0.17 ETH on a fresh 4.2 ETH pool, less as the price falls) refused every
+     * distribution for good while the queue kept growing (LR-6 of the 3 October re-audit).
+     *
+     * @dev The buy is bounded by the burn router's `maxBurnBuy`, a share of the pool's live ETH
+     * reserve, and the rest stays pending: spending the whole pot at once was one market order a
+     * caller could sandwich, since the caller chooses the moment (review of the fixes,
+     * 2026-10-02). `DistributeCooldownNotElapsed` keeps the bound from being chained within one
+     * transaction, which used to be possible because nothing paced distributions on-chain.
      *
      * @dev The router delivers the tokens to this contract, and that delivery runs this contract's
      * own transfer hook mid-call. That is safe because the hook only settles ledgers and moves
@@ -160,9 +176,13 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
      * pot keeps `reserved` above every claim; the price is at most a wei stranded per distribution.
      */
     function distribute() external nonReentrant {
+        if (block.timestamp < lastDistributedAt + DISTRIBUTE_COOLDOWN) revert DistributeCooldownNotElapsed();
         uint256 spend = pendingRewards;
-        if (spend == 0 || spend < rewardMin) revert NothingToDistribute();
-        pendingRewards = 0;
+        if (spend < rewardMin) revert NothingToDistribute();
+        uint256 bound = ISweepBurnRouter(burnRouter).maxBurnBuy(address(this));
+        if (bound < spend) spend = bound;
+        if (spend == 0) revert NothingToDistribute();
+        pendingRewards -= spend;
 
         ISweepBurnRouter(burnRouter).buyTokenWithEth{value: spend}(address(this), address(this));
 
@@ -219,9 +239,9 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
     /// @notice Points the buyback at a different router, which must be one the factory lists and
     /// is excluded from rewards like the one before it. The old router stays excluded: it never
     /// held a holder's share.
-    /// @dev The factory gate exists for the same reason as on the desks: without it this setter
-    /// sends every pending distribution to an arbitrary address. Reached through the hook's
-    /// immutable factory address; the zero address is never listed.
+    /// @dev The factory gate is decision 0015, for the same reason as on the desks: without it
+    /// this setter sends every pending distribution to an arbitrary address. Reached through the
+    /// hook's immutable factory reference; the zero address is never listed.
     function setBurnRouter(address router) external onlyOwner {
         if (!ISweepFactory(ISweepHooked(hook).factory()).isRouter(router)) revert RouterNotListed();
         burnRouter = router;
