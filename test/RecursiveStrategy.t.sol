@@ -295,11 +295,19 @@ contract RecursiveStrategyTest is Test {
 
     /* ───────────────────────────── guards ───────────────────────────── */
 
-    function test_AddFeesIsTheHooksAlone() public {
+    /// @notice Fees come from the hook or the launch's curve (decision 0021) and nobody else; a
+    /// curve's share waits in `pendingRewards` until a pool exists to buy on.
+    function test_AddFeesIsTheHookOrTheCurve() public {
         vm.deal(alice, 1 ether);
         vm.prank(alice);
-        vm.expectRevert(SweepToken.OnlyHook.selector);
+        vm.expectRevert(SweepToken.NotAFeeSource.selector);
         strategy.addFees{value: 1 ether}();
+
+        uint256 before = strategy.pendingRewards();
+        vm.deal(curveAddr, 1 ether);
+        vm.prank(curveAddr);
+        strategy.addFees{value: 1 ether}();
+        assertEq(strategy.pendingRewards(), before + 1 ether);
     }
 
     function test_TheLockStillRefusesWalletToWallet() public {

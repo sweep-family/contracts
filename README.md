@@ -41,13 +41,17 @@ Arbitrum Orbit L2 with ~101 ms blocks. A launch moves its whole supply of one bi
 its own bonding curve, which sells it against a virtual 1.68 ETH reserve until the curve holds
 4.2 ETH of real ETH (mainnet values; see [the curve's scale](#the-curves-scale)). The buy that crosses that line graduates the launch: a Uniswap v4 pool opens
 at the curve's exact final price, seeded with every wei the curve took in, and the position NFT
-goes to the dead address, so the liquidity can never be withdrawn by anyone. From then on every
-trade on the pool pays a ten percent fee to a hook. Eighty percent of that fee funds a treasury
-that buys what the strategy targets, relists it at a markup at the strategy's own desk, and burns
-the proceeds back into the token.
+goes to the dead address, so the liquidity can never be withdrawn by anyone.
 
-Most launches never find 4.2 ETH of demand. Those never open a pool and never run a desk: the
-curve is the filter.
+The machine runs from the first trade. Every curve trade pays 3%, of which 2.4% goes straight to
+the strategy's treasury; after graduation every pool trade pays a ten percent fee to a hook, of
+which eighty percent goes to the same treasury. The treasury buys what the strategy targets,
+relists it at a markup at the strategy's own desk, and burns the proceeds back into the token.
+Before graduation there is no pool to burn into, so a sale's proceeds go back to the treasury and
+buy the floor again.
+
+Most launches never find 4.2 ETH of demand. Those never open a pool, and what their desk bought
+stays on its shelf: the curve is the filter.
 
 **The token is not backed by what the treasury holds.** There is no redemption, no NAV, no claim.
 The inventory is a machine. Value reaches holders as buy pressure and burnt supply, never as a
@@ -77,7 +81,8 @@ excluded, fixed at launch, with no setter. Curve buyers are holders from their f
 ```
    ┌────────────── SweepBondingCurve (one clone per launch) ─────────┐
    │  the whole supply, sold against a virtual 1.68 ETH reserve       │
-   │  1% to the protocol + 2% to the creator on every trade           │
+   │  3% on every trade: 2.4% to the treasury (the desk runs from the │
+   │  first trade), 0.3% to the creator, 0.3% to the protocol         │
    │  99% snipe tax in the first second, gone after five              │
    │  the token stays transfer-locked: the curve is the only market   │
    └──────────────────────────────────────────────────────────────────┘
@@ -154,13 +159,16 @@ src/
   SweepNFTStrategy.sol         pieces: buyTargetNFT / sellTargetNFT
   SweepERC20Strategy.sol       bags:   buyTokens / sellTokens
   SweepRecursiveStrategy.sol   airdrops: distribute / claimFor / claim
-  SweepNFTStrategyFactory.sol  launch, launchERC20, launchRecursive; createGraduatedPool
+  SweepNFTStrategyFactory.sol  launch, launchWithCreator, launchERC20, launchRecursive;
+                               createGraduatedPool
   SweepHook.sol                the fee, its split, the router gate, the Trade event
   SweepBurnRouter.sol          proceeds → the strategy's own token → the dead address
   SweepSwapRouter.sol          buy / sell / quote for a front end, with the trader in hookData
+  SweepTokenListingRelay.sol   periphery: lets a desk buy a Seaport listing priced in an ERC-20
+                               (USDG) with ETH, through an exact-output swap; holds nothing
   libraries/                   SweepCurveMath (the curve's pricing), SweepGraduationMath (the seed)
   interfaces/                  ISweepFactory, ISweepFeeReceiver, ISweepLockedToken, ISweepBondingCurve,
-                               ISweepHookRegistry, ISweepBurnRouter, IOwnable
+                               ISweepHookRegistry, ISweepBurnRouter, IOwnable, ISeaport
   testing/                     SweepTestCollection, SweepTestToken: testnet fixtures, never for mainnet
 script/
   DeploySweep.s.sol            the whole stack: implementations → factory → mined hook → routers,
@@ -210,7 +218,7 @@ in the protocol is upgradeable: a change ships as a new stack.
 | Graduation | at 4.2 ETH of real ETH on the curve on mainnet; 5/7 of the supply sellable before it | `SweepBondingCurve.GRADUATION_THRESHOLD` (immutable) |
 | Graduation price | 12.25× the opening price, 20.58 ETH FDV; the pool opens at exactly this price | `SweepNFTStrategyFactory` |
 | Burnt at graduation | 4/49 of the supply (~8.16%), the reserved allocation the pool does not need | `createGraduatedPool` |
-| Curve fees | 1% to the protocol + 2% to the creator, on every curve trade's ETH leg | `SweepBondingCurve` |
+| Curve fees | 3% of every curve trade's ETH leg: 2.4% to the treasury in the trade, 0.3% creator, 0.3% protocol | `SweepBondingCurve.CURVE_TREASURY_SHARE` |
 | Snipe tax | 99% at second zero, ~25% at one, ~3% at two, zero from second five; launcher and creator exempt | `SweepBondingCurve` |
 | Pool | ETH / token, LP fee 0, tick spacing 60, hooked, full range | `SweepNFTStrategyFactory` |
 | Swap fee | 10% in both directions, flat from the pool's first block | `SweepHook.FEE_BPS` |
@@ -264,6 +272,10 @@ the bounds each setter enforces:
 - launch on behalf of a target, change the launch fee and its recipient, and change which
   implementation future launches clone.
 
+Who is paid a launch's creator share is chosen once, at the launch, by whoever pays for it:
+`launch` pays the caller, `launchWithCreator` an address the caller names. Neither the owner nor
+anyone else can move it afterwards, and the verified badge always records the signer.
+
 Each setter's NatSpec says what the lever reaches and why it exists. The owner is a multisig.
 
 ### Handing over a deployment
@@ -300,13 +312,15 @@ forge coverage --ir-minimum --report summary
 ```
 
 The fork suites (`Factory`, `FactoryERC20`, `FactoryRecursive`, `BurnRouter`, `BurnDepth`,
-`SwapRouter`, `PoolBypass`, `EndToEnd`, `Invariants`, `DeploySweep`) deploy the protocol against
-the real Uniswap v4 on Robinhood Chain at block 57,000,000. They need an **archive** endpoint in
+`SwapRouter`, `PoolBypass`, `EndToEnd`, `Invariants`, `DeploySweep`, `CurveMachine`,
+`CurveBidLump`) deploy the protocol against the real Uniswap v4 on Robinhood Chain at block
+57,000,000; `TokenListingRelay` forks mainnet at block 94,880,000 and buys a USDG listing on the
+live factory, the real ETH/USDG pool and Seaport 1.6. They need an **archive** endpoint in
 `ROBINHOOD_RPC_URL`: the public RPC does not serve historical state, so the
 harness refuses to start without one rather than failing inside the EVM. Without it, run the rest:
 
 ```bash
-forge test --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,BurnDepth,DeploySweep,EndToEnd,Invariants,PoolBypass,SwapRouter}.t.sol'
+forge test --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,BurnDepth,DeploySweep,EndToEnd,Invariants,PoolBypass,SwapRouter,CurveMachine,CurveBidLump,TokenListingRelay}.t.sol'
 ```
 
 CI runs both: the unit job on every pull request, the fork job and coverage on every push and on
@@ -319,6 +333,26 @@ FOUNDRY_PROFILE=intense forge test
 Uniswap v4 on Robinhood Chain (mainnet and testnet share the addresses, verified on-chain):
 PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951`. The rest is in
 `script/config/UniswapV4Addresses.sol`.
+
+## Deployed on Robinhood Chain mainnet
+
+The live stack, deployed on 21 October 2026 from this source and owned by a 2-of-2 Safe
+(`0x211fdA088d50079D7019EEE1F75cb832E1EfB59D`):
+
+| Contract | Address |
+| --- | --- |
+| `SweepNFTStrategyFactory` | `0x7ba2aDD3144313542F191029b6Ed8c2c76FB9F6D` |
+| `SweepHook` | `0xC102aE8F619143464140DfF07B6567229aBA2444` |
+| `SweepBondingCurve` (implementation) | `0xdde1901e1a6ba9f8f46aea5710700ea871a6a336` |
+| `SweepNFTStrategy` (implementation) | `0xb2b8742f612c821f14644adc1b4522898c5d6654` |
+| `SweepERC20Strategy` (implementation) | `0x5654de3be1595b04be1b1f84e1ece26e95ce20f5` |
+| `SweepRecursiveStrategy` (implementation) | `0xb0704d25befbe8df8a2958d4041654341987035b` |
+| `SweepBurnRouter` | `0x5d83be11d63e1e21185aa073dfb8fca2857992ab` |
+| `SweepSwapRouter` | `0x025ed74c4872be81cf523b08db1026a4fc3b8a62` |
+| `SweepTokenListingRelay` (22 October 2026) | `0x52e264790e4029831Fc0A178F5D1b21f909bE9E1` |
+
+All verified on Etherscan (`robin.etherscan.io`); the factory, hook, routers and relay also on
+Sourcify.
 
 ## Security
 

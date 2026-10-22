@@ -184,21 +184,6 @@ contract FactoryTest is SweepForkTest {
         assertGt(SweepNFTStrategy(payable(strategy)).treasury(), 0, "the machine did not start");
     }
 
-    /// @notice The desk's bid ramp restarts at graduation: days spent on the curve must not open
-    /// the desk with the bid already at its ceiling.
-    function test_GraduationResetsTheBidRamp() public {
-        (address strategy, SweepBondingCurve curve) = _launchOnCurve();
-        vm.warp(block.timestamp + 30 days);
-        vm.prank(whale);
-        curve.buy{value: 20 ether}(0, whale);
-        factory.createGraduatedPool(strategy);
-
-        _buy(_poolKeyFor(strategy), 1 ether);
-        SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
-        assertGt(s.treasury(), 0);
-        assertEq(s.currentBid(), 0, "the ramp arrived at graduation already climbed");
-    }
-
     /// @notice The base swap and burn routers can never be delisted, by anyone: with a
     /// transfer-locked token they are the only market, so an owner who could empty the list
     /// could freeze every holder's exit (decision 0015). An ordinary router still can be.
@@ -422,21 +407,23 @@ contract FactoryTest is SweepForkTest {
     }
 
     /// @notice Everything at once, on the real chain: a pool that did not exist a moment ago takes
-    /// a stranger's ETH, the hook skims it, and the strategy's treasury can now bid for an NFT.
-    /// This is the assertion the previous four bricks were built for.
+    /// a stranger's ETH, the hook skims it, and the strategy's treasury grows by it. The treasury
+    /// already holds the curve's share when the pool opens (decision 0021), so what this pins is
+    /// the pool trade's own contribution, and that the desk can bid on the sum.
     function test_TheLaunchedPoolCanBeTradedAndFundsTheTreasury() public {
         (address strategy, PoolKey memory key) = _launch();
         SweepNFTStrategy s = SweepNFTStrategy(payable(strategy));
 
-        assertEq(s.treasury(), 0, "funded before anyone traded");
+        uint256 fromTheCurve = s.treasury();
+        assertGt(fromTheCurve, 0, "the curve funded nothing");
 
         vm.prank(trader);
         sweepRouter.buy{value: 1 ether}(strategy, 0, block.timestamp);
 
-        assertGt(s.treasury(), 0, "the trade funded nothing");
+        assertGt(s.treasury(), fromTheCurve, "the trade funded nothing");
         assertGt(s.balanceOf(trader), 0, "the trader received no tokens");
 
-        assertEq(s.currentBid(), 0, "the bid ramp did not start from nothing");
+        assertEq(s.currentBid(), 0, "a lump of fees was biddable in the block it landed");
         vm.warp(block.timestamp + 10 minutes);
         assertGt(s.currentBid(), 0, "the desk still cannot bid after waiting");
     }
@@ -588,6 +575,67 @@ contract FactoryTest is SweepForkTest {
 
         assertFalse(ok, "the removed claim is still callable");
         assertEq(hook.creatorFeeRecipient(strategy), launcher, "the recipient moved");
+    }
+
+    /// @notice `launchWithCreator` pays the address the launcher names, on both venues: the hook's
+    /// creator tenth of the pool fee and the curve's creator share are registered to it, not to the
+    /// caller (decision 0022).
+    function test_LaunchWithCreatorPaysTheNamedRecipientOnThePoolAndTheCurve() public {
+        vm.prank(trader);
+        address strategy = factory.launchWithCreator{value: LAUNCH_FEE}(
+            address(collection), "Named", "NAMED", BID_PER_SECOND, MAX_BID, creator
+        );
+
+        assertEq(hook.creatorFeeRecipient(strategy), creator, "the hook pays the caller, not the named recipient");
+        assertEq(
+            SweepBondingCurve(payable(factory.curveOf(strategy))).creatorFeeRecipient(),
+            creator,
+            "the curve pays the caller, not the named recipient"
+        );
+    }
+
+    /// @notice A zero recipient on `launchWithCreator` pays the launcher, as `launch` does, so an
+    /// empty field in a front end can never send the creator share to the protocol by accident.
+    function test_LaunchWithCreatorAndNoRecipientPaysTheLauncher() public {
+        vm.prank(trader);
+        address strategy = factory.launchWithCreator{value: LAUNCH_FEE}(
+            address(collection), "Named", "NAMED", BID_PER_SECOND, MAX_BID, address(0)
+        );
+
+        assertEq(hook.creatorFeeRecipient(strategy), trader, "an empty recipient did not fall back to the launcher");
+        assertEq(SweepBondingCurve(payable(factory.curveOf(strategy))).creatorFeeRecipient(), trader);
+    }
+
+    /// @notice The badge stays on whoever signs. A stranger naming the collection's owner as the
+    /// recipient is not vouched for: otherwise anyone could buy the badge by paying its owner.
+    function test_NamingTheCollectionOwnerAsRecipientDoesNotVerifyAStranger() public {
+        vm.recordLogs();
+        vm.prank(trader);
+        factory.launchWithCreator{value: LAUNCH_FEE}(
+            address(collection), "Squat", "SQUAT", BID_PER_SECOND, MAX_BID, launcher
+        );
+
+        assertFalse(_launchWasVerified(), "the recipient's ownership vouched for the caller");
+    }
+
+    /// @notice And the owner who sends the creator share elsewhere keeps the badge: it records who
+    /// launched, not who is paid.
+    function test_TheOwnerKeepsTheBadgeWhenNamingAnotherRecipient() public {
+        vm.recordLogs();
+        vm.prank(launcher);
+        address strategy = factory.launchWithCreator{value: LAUNCH_FEE}(
+            address(collection), "Named", "NAMED", BID_PER_SECOND, MAX_BID, creator
+        );
+
+        assertTrue(_launchWasVerified(), "the owner's own launch lost its badge");
+        assertEq(hook.creatorFeeRecipient(strategy), creator);
+    }
+
+    /// @notice `launchWithCreator` charges the same fee as every other launch.
+    function test_LaunchWithCreatorChargesTheLaunchFee() public {
+        vm.prank(trader);
+        vm.expectRevert(SweepNFTStrategyFactory.WrongLaunchFee.selector);
+        factory.launchWithCreator(address(collection), "Named", "NAMED", BID_PER_SECOND, MAX_BID, creator);
     }
 
     /// @dev The badge as the chain records it. The factory emits it and stores nothing, so the log

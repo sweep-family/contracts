@@ -559,6 +559,8 @@ contract ERC20StrategyTest is Test {
     function _deploy(address token, uint256 bag, uint256 decayWindow) private returns (SweepERC20Strategy desk) {
         desk = SweepERC20Strategy(payable(LibClone.clone(address(new SweepERC20Strategy()))));
         desk.initialize(_config(token, bag, address(router), MULTIPLIER, decayWindow));
+        vm.prank(curveAddr);
+        desk.markGraduated();
     }
 
     function _config(address token, uint256 bag, address burnRouter, uint256 multiplierBps, uint256 decayWindow)

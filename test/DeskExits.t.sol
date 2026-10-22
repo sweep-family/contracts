@@ -440,8 +440,8 @@ contract DeskExitsTest is Test {
         desk.retire();
     }
 
-    /// @notice An empty treasury has nothing to retire — which also covers every desk still on
-    /// its curve, since fees only arrive once the pool exists.
+    /// @notice An empty treasury has nothing to retire. (A desk still on its curve is refused
+    /// earlier, by `StillOnCurve`: see CurveMachine.t.sol.)
     function test_ADeskWithAnEmptyTreasuryCannotRetire() public {
         (SweepNFTStrategy desk,) = _nftDesk();
         vm.warp(block.timestamp + 365 days);
@@ -633,6 +633,8 @@ contract DeskExitsTest is Test {
         config.owner = owner;
         config.curve = makeAddr("curve");
         desk.initialize(config);
+        vm.prank(config.curve);
+        desk.markGraduated();
         _stockRouter(address(desk));
     }
 
@@ -654,6 +656,8 @@ contract DeskExitsTest is Test {
         config.owner = owner;
         config.curve = makeAddr("curve");
         desk.initialize(config);
+        vm.prank(config.curve);
+        desk.markGraduated();
         _stockRouter(address(desk));
 
         t.mint(seller, 100 * BAG);

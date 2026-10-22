@@ -58,15 +58,17 @@ contract EndToEndTest is SweepForkTest {
         console2.log("1. launched         fee paid %s wei, position owned by 0x...dEaD", LAUNCH_FEE);
     }
 
-    /// @dev The first buy of the pool's life pays the flat 10%, 80% of it into the treasury —
+    /// @dev The first buy of the pool's life pays the flat 10%, 80% of it into the treasury, on top
+    /// of what the curve's trades already paid in (decision 0021) —
     /// the same deal as every buy after it, since decision 0012 removed the launch ramp. The
     /// band is wider than 8% ± rounding because the graduated pool is 4.2 ETH deep (decision
     /// 0013): the hook converts its token fee by selling into the pool the buy just moved, so
     /// price impact cuts a visible slice both ways.
     function _stage2FirstBuy() internal {
+        uint256 before = s.treasury();
         _buy(key, 1 ether);
-        assertGt(s.treasury(), 0.07 ether, "the first buy funded less than eight percent");
-        assertLt(s.treasury(), 0.105 ether, "the first buy paid a launch premium");
+        assertGt(s.treasury() - before, 0.07 ether, "the first buy funded less than eight percent");
+        assertLt(s.treasury() - before, 0.105 ether, "the first buy paid a launch premium");
         console2.log("2. bought 1 ETH     treasury %s wei, buyer holds %s tokens", s.treasury(), s.balanceOf(trader));
     }
 

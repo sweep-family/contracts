@@ -89,8 +89,9 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
     /// problem; it turns an unbounded drift into a number somebody chose and can be held to.
     uint256 public maxBid;
 
-    /// @notice Where the bid ramp starts, in whole seconds: the last purchase that used up the
-    /// whole bid, or the graduation, or the point a partial purchase moved it to.
+    /// @notice Where the bid ramp starts, in whole seconds: the launch, the last purchase that used
+    /// up the whole bid, or the point a partial purchase moved it to. Graduation does not move it
+    /// (decision 0021).
     uint256 public lastPurchaseAt;
 
     /// @notice Wei of ramp already spent since `lastPurchaseAt`, always below one second of ramp
@@ -144,7 +145,13 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
     /// into the burn one pass at a time (decision 0017). Final once set.
     bool public retired;
 
+    /// @notice Whether the launch has graduated into its pool, set by the curve's notice. Before
+    /// it nothing can buy the token, so a sale's proceeds go back to the treasury instead of the
+    /// burn queue, and the desk cannot be retired (decision 0021, audit H-1 of PR #74).
+    bool public graduated;
+
     error NothingToBurn();
+    error StillOnCurve();
     error BurnCooldownNotElapsed();
     error BidRaiseTooLarge();
     error BidRaiseTooSoon();
@@ -156,6 +163,7 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
 
     event FeesReceived(uint256 amount, uint256 treasury);
     event SaleRecorded(uint256 proceeds, uint256 pendingBurn);
+    event SaleRecycled(uint256 proceeds, uint256 treasury);
     event PurchaseRecorded(uint256 cost, uint256 treasury);
     event Burned(address indexed caller, uint256 spent, uint256 reward);
     event BurnPacingUpdated(uint256 increment, uint256 cooldown);
@@ -194,21 +202,6 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
     }
 
     /**
-     * @notice The curve's graduation notice: restarts the bid ramp at the moment the machine
-     * actually starts.
-     *
-     * @dev Without this reset, a launch that spent days on its curve would open its desk with
-     * the ramp fully climbed, and the bid would jump to the ceiling the moment the first
-     * post-graduation fee funds the treasury — the desk would overpay for its very first piece
-     * by exactly the age of the curve. Restricted to the curve for the reason on the base
-     * declaration.
-     */
-    function markGraduated() external virtual override onlyCurve {
-        lastPurchaseAt = block.timestamp;
-        rampSpent = 0;
-    }
-
-    /**
      * @notice What the protocol will pay right now for one unit of the asset it buys.
      *
      * @dev The protocol has no oracle and cannot see an off-chain listing, so it cannot ask what
@@ -234,12 +227,59 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
         return bid < treasury ? bid : treasury;
     }
 
-    /// @notice Funds the treasury from a swap's fee.
-    /// @dev Restricted to the hook because it is the only thing that observes a swap; anyone else
-    /// sending ETH here would inflate the bid without a trade having happened.
-    function addFees() external payable onlyHook {
-        treasury += msg.value;
+    /// @notice Funds the treasury from a trade's fee: a pool swap's, through the hook, or a curve
+    /// trade's, through the launch's curve (decision 0021).
+    /// @dev Restricted to those two because they are the only things that observe a trade; anyone
+    /// else sending ETH here would inflate the bid without a trade having happened.
+    function addFees() external payable onlyFeeSource {
+        _creditTreasury(msg.value);
         emit FeesReceived(msg.value, treasury);
+    }
+
+    /**
+     * @notice The curve's graduation notice: records that the pool now exists.
+     *
+     * @dev It leaves the bid ramp alone, since the desk has been running since launch (decision
+     * 0021). What it switches is the fate of a sale: from here on proceeds queue for the burn,
+     * which the pool can now run, and `retire` becomes possible. Restricted to the curve so the
+     * notice cannot be forged.
+     */
+    function markGraduated() external virtual override onlyCurve {
+        graduated = true;
+    }
+
+    /**
+     * @dev Adds to the treasury without letting the new money be bid all at once.
+     *
+     * @dev The bid is `min(ramp, maxBid, treasury)`, and the ramp keeps climbing while the treasury
+     * is too small to buy anything. Left alone, a desk idle for a day held a whole day of ramp above
+     * its treasury, and the block a large fee landed — the crossing buy, a burst of pool trades, a
+     * recycled sale — the bid jumped to the cap: on the fork, a 0.0004 ETH floor piece sold for ten
+     * times its price in that block (audit C-2 of PR #74). So when the treasury is what binds the
+     * bid, the ramp is first brought down to stand exactly at the treasury as it was; the new money
+     * then becomes biddable at the ramp's pace, as an ascending auction should release it. When the
+     * cap binds instead, new money changes no bid and the ramp is left where it is, which also keeps
+     * `retire`'s clock running on a dead desk whose fees keep arriving.
+     */
+    function _creditTreasury(uint256 amount) internal {
+        uint256 before = treasury;
+        if (before < maxBid) _bringRampDownTo(before);
+        treasury = before + amount;
+    }
+
+    /**
+     * @dev Lowers the standing ramp to exactly `ceiling` when it has climbed above it, in the
+     * representation the ramp is kept in: whole seconds in `lastPurchaseAt`, the wei below one
+     * second in `rampSpent`. A ramp at or below the ceiling is left untouched.
+     */
+    function _bringRampDownTo(uint256 ceiling) internal {
+        uint256 increase = bidIncreasePerSecond;
+        uint256 grown = (block.timestamp - lastPurchaseAt) * increase;
+        uint256 standing = grown > rampSpent ? grown - rampSpent : 0;
+        if (standing <= ceiling) return;
+        uint256 secondsToCeiling = (ceiling + increase - 1) / increase;
+        lastPurchaseAt = block.timestamp - secondsToCeiling;
+        rampSpent = secondsToCeiling * increase - ceiling;
     }
 
     /**
@@ -303,10 +343,11 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
      * gate replaced it. The accepted cost is that a truly dead desk stays frozen until its owner
      * (the Safe, for protocol launches) acts.
      *
-     * @dev `AlreadyRetired` keeps the event and the moment single. `NothingToRetire` refuses a
-     * desk with an empty treasury, which is also every desk still on its curve, since fees only
-     * arrive once the pool exists. Without it a launch that took a month to graduate could be
-     * retired before it ever had a treasury to spend.
+     * @dev `AlreadyRetired` keeps the event and the moment single. `StillOnCurve` refuses a desk
+     * whose launch has not graduated: retiring turns the treasury into burn queue, and before the
+     * pool exists nothing can run that queue, so a desk retired on its curve would only strand its
+     * treasury and every curve fee after it (audit H-1 of PR #74). `NothingToRetire` refuses a
+     * desk with an empty treasury: retiring it would release nothing.
      *
      * @dev `DeskStillBidding` is the test of death, and it binds the owner too. The desk must
      * have published its whole bid, `min(maxBid, treasury)`, for `RETIRE_GRACE` beyond the moment
@@ -324,6 +365,7 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
      */
     function retire() external onlyOwner nonReentrant {
         if (retired) revert AlreadyRetired();
+        if (!graduated) revert StillOnCurve();
         if (treasury == 0) revert NothingToRetire();
         uint256 full = maxBid < treasury ? maxBid : treasury;
         uint256 waited = block.timestamp - lastPurchaseAt;
@@ -525,8 +567,17 @@ abstract contract SweepStrategy is SweepToken, ISweepFeeReceiver {
         emit PurchaseRecorded(cost, treasury);
     }
 
-    /// @dev Books a sale. Proceeds join the burn queue and never the treasury.
+    /// @dev Books a sale. After graduation the proceeds join the burn queue and never the
+    /// treasury. Before it nothing can buy the token to burn, so they go back to the treasury and
+    /// buy the floor again (`SaleRecycled`) instead of waiting, forever if the launch never
+    /// graduates, for a pool (decision 0021, audit H-1 of PR #74). Recycled through
+    /// `_creditTreasury`, so a large sale is released to the bid at the ramp's pace too.
     function _recordSale(uint256 proceeds) internal {
+        if (!graduated) {
+            _creditTreasury(proceeds);
+            emit SaleRecycled(proceeds, treasury);
+            return;
+        }
         pendingBurn += proceeds;
         emit SaleRecorded(proceeds, pendingBurn);
     }

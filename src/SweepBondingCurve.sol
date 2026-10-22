@@ -53,11 +53,20 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     /// @notice The real ETH that ends the curve and seeds the pool: 4.2 ETH on mainnet.
     uint256 public immutable GRADUATION_THRESHOLD;
 
-    /// @notice The protocol's cut of every trade's quote leg.
+    /// @notice One of the two parts of the 3% every trade's quote leg pays: 1%. Since decision 0021
+    /// the 3% is not paid out by these names any more but split by the shares below; the two
+    /// constants stay as they are so pricing, quotes and the graduation are unchanged.
     uint256 public constant CURVE_FEE_BPS = 100;
 
-    /// @notice The creator's cut of every trade's quote leg.
+    /// @notice The other part of the 3%: 2%. See `CURVE_FEE_BPS`.
     uint256 public constant CREATOR_TAX_BPS = 200;
+
+    /// @notice The strategy treasury's share of a trade's 3%, in percent: 80, sent to the
+    /// strategy in the trade (decision 0021). The same split the hook applies to the pool's fee.
+    uint256 public constant CURVE_TREASURY_SHARE = 80;
+
+    /// @notice The creator's share of a trade's 3%, in percent: 10. The protocol takes the rest.
+    uint256 public constant CURVE_CREATOR_SHARE = 10;
 
     /// @notice Where the anti-snipe tax starts, at the launch second.
     uint256 public constant SNIPE_TAX_START_BPS = 9900;
@@ -104,11 +113,17 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     /// priced with, fixed at initialize as `supply · P / (P + T)`.
     uint256 public reservedTokens;
 
-    /// @notice Quote fees owed to the protocol, the snipe tax included.
+    /// @notice Quote fees owed to the protocol: its 10% of each trade's 3%, and the whole snipe tax.
     uint256 public protocolFeeBalance;
 
-    /// @notice Quote fees owed to the creator.
+    /// @notice Quote fees owed to the creator: its 10% of each trade's 3%.
     uint256 public creatorFeeBalance;
+
+    /// @notice The treasury's share of trades the strategy could not take when they happened,
+    /// owed to it and paid by the next `sweepFees`. Zero in normal operation: the share is sent in
+    /// the trade itself, and this bucket exists so that no trade ever depends on the strategy
+    /// accepting it (audit C-1 of PR #74).
+    uint256 public treasuryFeeBalance;
 
     /// @notice Set by `graduate`, which does nothing else. Once true, trading is over for good and
     /// the only remaining moves are the factory's `completeGraduation` and the fee sweep.
@@ -124,6 +139,14 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
         uint256 tokensOut;
     }
 
+    /// @dev One trade's 3%, split: what went to the treasury in the trade, and what joined each
+    /// bucket. Boxed for the same stack reason as `BuyQuote`.
+    struct FeeSplit {
+        uint256 treasury;
+        uint256 creator;
+        uint256 protocol;
+    }
+
     event CurveBuy(
         address indexed buyer,
         address indexed recipient,
@@ -131,6 +154,7 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
         uint256 tokensOut,
         uint256 protocolFee,
         uint256 creatorFee,
+        uint256 treasuryFee,
         uint256 snipeTax,
         uint256 quoteReserveAfter,
         uint256 tokenReserveAfter
@@ -142,12 +166,15 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
         uint256 ethOut,
         uint256 protocolFee,
         uint256 creatorFee,
+        uint256 treasuryFee,
         uint256 quoteReserveAfter,
         uint256 tokenReserveAfter
     );
     event BuyRefunded(address indexed buyer, uint256 refund);
     event SnipeTaxCharged(address indexed recipient, uint256 amount);
     event FeesSwept(uint256 protocolAmount, uint256 creatorAmount);
+    event TreasuryFeeDeferred(uint256 amount);
+    event TreasuryFeePaid(uint256 amount);
     event Graduated(uint256 finalQuote, uint256 finalTokens);
     event CurveCompleted(uint256 ethOut, uint256 tokenOut);
     event AutoGraduationFailed(uint256 gasRemaining);
@@ -243,10 +270,10 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
             revert SlippageExceeded(quote.tokensOut, minTokensOut);
         }
 
-        protocolFeeBalance += quote.fee + quote.snipeTax;
-        creatorFeeBalance += quote.tax;
-        trackedQuote += quote.spent;
+        FeeSplit memory split = _bookFees(quote.fee + quote.tax, quote.snipeTax);
+        trackedQuote += quote.spent - split.treasury;
         trackedTokens -= quote.tokensOut;
+        _payTreasury(split.treasury);
         SafeTransferLib.safeTransfer(token, recipient, quote.tokensOut);
 
         uint256 refund = received - quote.spent;
@@ -262,8 +289,9 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
             recipient,
             quote.spent,
             quote.tokensOut,
-            quote.fee,
-            quote.tax,
+            split.protocol,
+            split.creator,
+            split.treasury,
             quote.snipeTax,
             quoteReserveAfter,
             trackedTokens
@@ -312,14 +340,24 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
         ethOut = gross - fee - tax;
         if (ethOut < minEthOut) revert SlippageExceeded(ethOut, minEthOut);
 
-        protocolFeeBalance += fee;
-        creatorFeeBalance += tax;
-        trackedQuote -= ethOut;
+        FeeSplit memory split = _bookFees(fee + tax, 0);
+        trackedQuote -= ethOut + split.treasury;
         trackedTokens += tokensIn;
+        _payTreasury(split.treasury);
         SafeTransferLib.safeTransferETH(recipient, ethOut);
 
         (uint256 quoteReserveAfter,) = getReserves();
-        emit CurveSell(msg.sender, recipient, tokensIn, ethOut, fee, tax, quoteReserveAfter, trackedTokens);
+        emit CurveSell(
+            msg.sender,
+            recipient,
+            tokensIn,
+            ethOut,
+            split.protocol,
+            split.creator,
+            split.treasury,
+            quoteReserveAfter,
+            trackedTokens
+        );
     }
 
     /**
@@ -361,9 +399,9 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
      * and emit a lying event. The factory calls this inside `createGraduatedPool`, so the
      * reserves are only ever on the curve or in the pool — a failed seed reverts the whole
      * transaction back to a halted, solvent, retryable curve, which is why no rescue function
-     * exists (decision 0014). The token is told `markGraduated` before the transfers: the
-     * strategy uses it to reset its bid ramp, and it must observe graduation before any balance
-     * moves.
+     * exists (decision 0014). The token is told `markGraduated` before the transfers, so a token
+     * that acts on it observes graduation before any balance moves; since decision 0021 the
+     * strategies record it, and it switches their sales from recycling to burning.
      *
      * @dev The ETH handed over is `realQuoteReserve()`, never `trackedQuote`: graduation no longer
      * sweeps the buckets, so `trackedQuote` may still hold fees owed to the protocol and the
@@ -397,7 +435,9 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
      * pays nobody, so this is the only path the fees owed at graduation leave by.
      *
      * @dev `NothingToSweep` reverts on empty buckets so a mis-scheduled sweep reads as a revert
-     * rather than a silent success.
+     * rather than a silent success. The treasury's owed share (`treasuryFeeBalance`, normally zero)
+     * is paid first, by a `try`, so a strategy still refusing it never stops the protocol and the
+     * creator being paid.
      *
      * The buckets are zeroed and their wei released from `trackedQuote` before a single wei
      * leaves, and the function holds the reentrancy lock: a recipient handed control by the
@@ -415,7 +455,8 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     function sweepFees() external nonReentrant {
         uint256 protocolAmount = protocolFeeBalance;
         uint256 creatorAmount = creatorFeeBalance;
-        if (protocolAmount + creatorAmount == 0) revert NothingToSweep();
+        if (protocolAmount + creatorAmount + treasuryFeeBalance == 0) revert NothingToSweep();
+        _payOwedTreasury();
 
         protocolFeeBalance = 0;
         creatorFeeBalance = 0;
@@ -439,14 +480,14 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     /// @notice The reserves the pricing sees: the phantom plus every tracked wei not earmarked
     /// as fees, against the tracked tokens.
     function getReserves() public view returns (uint256 quoteReserve, uint256 tokenReserve) {
-        quoteReserve = PHANTOM_QUOTE + trackedQuote - protocolFeeBalance - creatorFeeBalance;
+        quoteReserve = PHANTOM_QUOTE + trackedQuote - protocolFeeBalance - creatorFeeBalance - treasuryFeeBalance;
         tokenReserve = trackedTokens;
     }
 
     /// @notice The real ETH the curve has taken in and not earmarked — the pool's future seed,
     /// and the number the graduation progress bar reads.
     function realQuoteReserve() public view returns (uint256) {
-        return trackedQuote - protocolFeeBalance - creatorFeeBalance;
+        return trackedQuote - protocolFeeBalance - creatorFeeBalance - treasuryFeeBalance;
     }
 
     /// @notice Tokens still buyable before the curve is full.
@@ -503,6 +544,59 @@ contract SweepBondingCurve is Initializable, ReentrancyGuard {
     /// `selfdestruct` can still force ETH in, which is why the books are counters.
     receive() external payable {
         revert DirectPaymentRejected();
+    }
+
+    /**
+     * @dev Splits one trade's 3% into the treasury's 80%, the creator's 10% and the protocol's
+     * rest, and books the two bucket shares (decision 0021). The snipe tax is the protocol's whole
+     * and joins its bucket untouched: it exists to make a launch's first seconds unprofitable for a
+     * bot, not to fund the desk. The protocol's share is the remainder rather than its own 10% so
+     * every wei of the 3% is accounted for, rounding included. The treasury's share is returned,
+     * not booked: it leaves the curve in the same trade, through `_payTreasury`.
+     */
+    function _bookFees(uint256 fees, uint256 snipeTax) private returns (FeeSplit memory split) {
+        split.treasury = (fees * CURVE_TREASURY_SHARE) / 100;
+        split.creator = (fees * CURVE_CREATOR_SHARE) / 100;
+        split.protocol = fees - split.treasury - split.creator;
+        protocolFeeBalance += split.protocol + snipeTax;
+        creatorFeeBalance += split.creator;
+    }
+
+    /**
+     * @dev Sends the treasury's share to the strategy, which credits it as fees: the desk can spend
+     * it from this trade on, with no sweep and no keeper in between. The strategy accepts fees from
+     * its own curve and its hook only (`onlyFeeSource`). Called after the books have moved; the
+     * strategy's `addFees` only adds to a counter and emits, and the curve is `nonReentrant`, so the
+     * call cannot reach back into a trade half-done.
+     *
+     * @dev The send is a `try`: if the strategy refuses it for any reason, the share stays on the
+     * curve as `treasuryFeeBalance`, earmarked inside `trackedQuote` like the other buckets, and the
+     * trade goes through. A trade that depended on the strategy taking the money would let any
+     * fault there — a mismatched implementation, a future kind — freeze every buy and every sell on
+     * the curve, the holders' exit included, until a new stack (audit C-1 of PR #74).
+     */
+    function _payTreasury(uint256 amount) private {
+        if (amount == 0) return;
+        try ISweepCurveToken(token).addFees{value: amount}() {}
+        catch {
+            trackedQuote += amount;
+            treasuryFeeBalance += amount;
+            emit TreasuryFeeDeferred(amount);
+        }
+    }
+
+    /**
+     * @dev Pays the treasury what earlier trades could not send it. Also a `try`: a strategy still
+     * refusing leaves the share owed, so `sweepFees` keeps paying the protocol and the creator.
+     */
+    function _payOwedTreasury() private {
+        uint256 owed = treasuryFeeBalance;
+        if (owed == 0) return;
+        try ISweepCurveToken(token).addFees{value: owed}() {
+            treasuryFeeBalance = 0;
+            trackedQuote -= owed;
+            emit TreasuryFeePaid(owed);
+        } catch {}
     }
 
     /**

@@ -366,6 +366,40 @@ contract SweepNFTStrategyFactory is Ownable, ReentrancyGuard, ISweepFactory {
     }
 
     /**
+     * @notice Launches a strategy on `collection` whose creator share is paid to
+     * `creatorFeeRecipient`, for the fee. Anyone may call this (decision 0022).
+     *
+     * @dev Everything is `launch`'s but the recipient, which the launcher names instead of being
+     * it: a team that launches from one wallet and is paid on another, or a launch made for a
+     * partner. The recipient is registered with the hook and the curve in the same transaction and
+     * is as final as `launch`'s; naming it is a choice made once, at the launch, by whoever pays
+     * for it, which is what decision 0009 protects, and no later `owner()` can re-point it.
+     *
+     * @dev A zero `creatorFeeRecipient` pays the caller, as `launch` does. Without it a front end
+     * that sends an empty field would hand the creator share to the protocol for good, which only
+     * `ownerLaunch` may do on purpose.
+     *
+     * @dev The verified badge stays the caller's: `_launch` compares the collection's `owner()` with
+     * `msg.sender`, never with the recipient. Compared with the recipient, anyone could earn the
+     * badge for a launch the owner never made by naming the owner as the payee.
+     *
+     * @dev `TargetNotAdmitted` gates it exactly as it gates `launch`: naming a recipient is not a
+     * way round curation (decision 0018).
+     */
+    function launchWithCreator(
+        address collection,
+        string calldata name_,
+        string calldata symbol_,
+        uint256 bidIncreasePerSecond,
+        uint256 maxBid,
+        address creatorFeeRecipient
+    ) external payable nonReentrant returns (address) {
+        _assertAdmitted(collection);
+        address recipient = creatorFeeRecipient == address(0) ? msg.sender : creatorFeeRecipient;
+        return _launch(collection, name_, symbol_, bidIncreasePerSecond, maxBid, recipient);
+    }
+
+    /**
      * @notice Launches a strategy on behalf of a collection that cannot prove its owner on-chain.
      *
      * @dev Since decision 0009 this skips no gate, because there is none to skip. What it still

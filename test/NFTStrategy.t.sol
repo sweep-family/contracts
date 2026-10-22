@@ -69,6 +69,8 @@ contract NFTStrategyTest is Test {
                 owner
             )
         );
+        vm.prank(curveAddr);
+        strategy.markGraduated();
 
         vm.prank(owner);
         strategy.setDistributor(address(this), true);

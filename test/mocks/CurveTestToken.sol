@@ -34,6 +34,26 @@ contract CurveTestToken is ERC20 {
         _mint(to, amount);
     }
 
+    /// @notice Every wei the curve sent as the treasury's share, and who sent the last of it.
+    uint256 public feesReceived;
+    address public lastFeeSender;
+
+    /// @notice Stands in for the strategy's `addFees`: records the treasury's share of a curve
+    /// trade the way the real token credits its treasury (decision 0021).
+    /// @notice When set, `addFees` reverts, standing in for any strategy that cannot take the
+    /// treasury's share (audit C-1 of PR #74).
+    bool public refuseFees;
+
+    function setRefuseFees(bool refuse) external {
+        refuseFees = refuse;
+    }
+
+    function addFees() external payable {
+        if (refuseFees) revert("refused");
+        feesReceived += msg.value;
+        lastFeeSender = msg.sender;
+    }
+
     function markGraduated() external {
         markGraduatedCalls += 1;
         lastGraduationCaller = msg.sender;

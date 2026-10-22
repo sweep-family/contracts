@@ -67,6 +67,7 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
 
     error OnlyHook();
     error OnlyCurve();
+    error NotAFeeSource();
     error TransferNotAllowed();
     error InvalidConfiguration();
     error DistributorEntryFixed();
@@ -81,6 +82,14 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
 
     modifier onlyHook() {
         if (msg.sender != hook) revert OnlyHook();
+        _;
+    }
+
+    /// @dev The two things that see a trade and may fund the strategy from it: the hook, for the
+    /// pool, and the launch's own curve, before graduation (decision 0021). Both are written once
+    /// at initialisation, so the set of fee sources is fixed at launch.
+    modifier onlyFeeSource() {
+        if (msg.sender != hook && msg.sender != curve) revert NotAFeeSource();
         _;
     }
 
@@ -141,10 +150,10 @@ abstract contract SweepToken is ERC20, Ownable, Initializable, ReentrancyGuard, 
      * @notice The curve's graduation notice, sent inside `completeGraduation` before any balance
      * moves.
      *
-     * @dev A no-op at the token level; `SweepStrategy` overrides it to reset the bid ramp, which
-     * would otherwise have been climbing for the whole life of the curve and would open the desk
-     * at its ceiling the moment the first fee lands. Restricted to the curve because a stranger
-     * who could call it would reset the ramp at will and hold the desk's bid at zero forever.
+     * @dev A no-op at the token level. `SweepStrategy` overrides it to record that the pool exists,
+     * which switches a sale from recycling into the treasury to queueing its burn (decision 0021);
+     * until 0021 the override restarted the bid ramp instead. Restricted to the curve so the notice
+     * cannot be forged.
      */
     function markGraduated() external virtual onlyCurve {}
 

@@ -47,6 +47,7 @@ interface ISweepBondingCurve {
 interface ISweepCurveToken {
     function hook() external view returns (address);
     function markGraduated() external;
+    function addFees() external payable;
     function totalSupply() external view returns (uint256);
     function balanceOf(address account) external view returns (uint256);
 }

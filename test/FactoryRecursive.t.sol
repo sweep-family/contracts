@@ -35,6 +35,11 @@ import {GasBurningLauncher, IRecursiveLaunch} from "./mocks/CurveTestActors.sol"
  * @dev Everything the NFT launch already proves about the pool is shared code and is not proved
  * twice. What is new is a strategy the factory knows without a collection behind it.
  */
+/// @notice The one call the gas probe makes on the strategy.
+interface IRecursiveFees {
+    function addFees() external payable;
+}
+
 contract FactoryRecursiveTest is SweepForkTest {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -204,8 +209,9 @@ contract FactoryRecursiveTest is SweepForkTest {
         assertEq(curve.creatorFeeRecipient(), address(burner));
 
         vm.warp(block.timestamp + 5);
+        uint256 callGas = _crossingBuyGas() + _treasuryPushGas(strategy, address(curve));
         vm.prank(whale);
-        curve.buy{value: 20 ether, gas: _crossingBuyGas()}(0, whale);
+        curve.buy{value: 20 ether, gas: callGas}(0, whale);
         assertTrue(curve.graduated(), "the crossing buy left graduation failed");
 
         uint256 protocolOwed = curve.protocolFeeBalance();
@@ -231,6 +237,20 @@ contract FactoryRecursiveTest is SweepForkTest {
     /// whose unoptimized bytecode costs more, it is all the gas left (see the test above).
     function _crossingBuyGas() private view returns (uint256) {
         return vm.isContext(VmSafe.ForgeContext.Coverage) ? gasleft() : 257_603 - 21_000 - 1000;
+    }
+
+    /// @notice What the curve's send of the treasury's share costs on the real token, so the
+    /// wallet's estimate above can include it (decision 0021: the crossing buy now pays the
+    /// strategy its share in the trade). Measured as a first send, cold, and the state rolled
+    /// back, so it bounds the cost inside the buy from above.
+    function _treasuryPushGas(address strategy, address curve) private returns (uint256 used) {
+        uint256 snapshot = vm.snapshotState();
+        vm.deal(curve, curve.balance + 1);
+        vm.prank(curve);
+        uint256 before = gasleft();
+        IRecursiveFees(strategy).addFees{value: 1}();
+        used = before - gasleft();
+        vm.revertToState(snapshot);
     }
 
     /* ─────────────────────────── the routers ────────────────────────── */

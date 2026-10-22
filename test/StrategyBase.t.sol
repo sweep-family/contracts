@@ -39,6 +39,8 @@ contract StrategyBaseTest is Test {
         vm.warp(1_788_000_000);
         strategy = StrategyHarness(payable(LibClone.clone(address(new StrategyHarness()))));
         strategy.initialize("Phantom Strategy", "PHSTR", hook, poolManager, curve, BID_PER_SECOND, MAX_BID, owner);
+        vm.prank(curve);
+        strategy.markGraduated();
     }
 
     /* ─────────────────────────── the token ─────────────────────────── */
@@ -208,12 +210,53 @@ contract StrategyBaseTest is Test {
 
     /* ─────────────────────────── the treasury ──────────────────────── */
 
-    /// @notice Only the hook may fund the treasury, since it is the only thing that sees a swap.
-    function test_OnlyHookCanAddFees() public {
+    /// @notice Only the hook and the launch's own curve may fund the treasury: they are the only
+    /// things that see a trade (decision 0021). Anyone else sending ETH here would inflate the bid
+    /// without a trade having happened.
+    function test_OnlyTheHookOrTheCurveCanAddFees() public {
         vm.deal(alice, 1 ether);
         vm.prank(alice);
-        vm.expectRevert(SweepToken.OnlyHook.selector);
+        vm.expectRevert(SweepToken.NotAFeeSource.selector);
         strategy.addFees{value: 1 ether}();
+
+        vm.deal(curve, 1 ether);
+        vm.prank(curve);
+        strategy.addFees{value: 1 ether}();
+        assertEq(strategy.treasury(), 1 ether, "the curve's share did not reach the treasury");
+    }
+
+    /// @notice Fees arriving on a desk whose ramp has been saving up are not biddable at once:
+    /// the ramp is first brought down to the treasury as it stood, so the new money becomes
+    /// biddable at the ramp's pace (audit C-2 of PR #74). Without it a desk idle for a month with a
+    /// small treasury would bid its whole cap the block a large fee landed.
+    function test_FeesAboveASavedRampBecomeBiddableAtTheRampsPace() public {
+        vm.deal(hook, 11 ether);
+        vm.prank(hook);
+        strategy.addFees{value: 0.001 ether}();
+        vm.warp(block.timestamp + 30 days);
+        assertEq(strategy.currentBid(), 0.001 ether, "the saved ramp should stand above the treasury");
+
+        vm.prank(hook);
+        strategy.addFees{value: 10 ether}();
+        assertEq(strategy.currentBid(), 0.001 ether, "the lump was biddable in the block it landed");
+
+        vm.warp(block.timestamp + 10);
+        assertEq(strategy.currentBid(), 0.001 ether + 10 * BID_PER_SECOND);
+    }
+
+    /// @notice Fees landing on a desk already bidding its cap leave the ramp where it is: the cap,
+    /// not the treasury, binds, so the new money changes no bid, and the retire clock is kept.
+    function test_FeesAtTheCapLeaveTheRampAlone() public {
+        vm.deal(hook, 10 ether);
+        vm.prank(hook);
+        strategy.addFees{value: 5 ether}();
+        vm.warp(block.timestamp + 30 days);
+        uint256 anchor = strategy.lastPurchaseAt();
+
+        vm.prank(hook);
+        strategy.addFees{value: 5 ether}();
+        assertEq(strategy.lastPurchaseAt(), anchor, "the ramp moved under a cap that did not");
+        assertEq(strategy.currentBid(), MAX_BID);
     }
 
     /// @notice Fees accumulate rather than replacing one another.
@@ -638,19 +681,16 @@ contract StrategyBaseTest is Test {
 
     /* ────────────────────── graduation notice ───────────────────────── */
 
-    /// @notice Graduation resets the bid ramp: a launch that spent days on its curve must not
-    /// open its desk with the ramp fully climbed and the bid at the ceiling.
-    function test_MarkGraduatedResetsTheBidRamp() public {
+    /// @notice Graduation leaves the bid ramp alone: the desk runs from the curve (decision
+    /// 0021), so restarting the ramp when the pool opens would only stall a running desk.
+    function test_MarkGraduatedLeavesTheBidRampRunning() public {
         strategy.exposed_fund(100 ether);
         vm.warp(block.timestamp + 30 days);
         assertEq(strategy.currentBid(), MAX_BID, "the ramp should have hit the ceiling");
 
         vm.prank(curve);
         strategy.markGraduated();
-        assertEq(strategy.currentBid(), 0, "the ramp did not restart");
-
-        vm.warp(block.timestamp + 10);
-        assertEq(strategy.currentBid(), 10 * BID_PER_SECOND);
+        assertEq(strategy.currentBid(), MAX_BID, "graduation restarted the ramp");
     }
 
     /// @notice Only the curve may send the notice: a stranger who could reset the ramp at will

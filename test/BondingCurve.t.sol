@@ -6,6 +6,7 @@ import {LibClone} from "solady/src/utils/LibClone.sol";
 
 import {SweepBondingCurve} from "../src/SweepBondingCurve.sol";
 import {CurveTestToken} from "./mocks/CurveTestToken.sol";
+import {SweepCurveMath} from "../src/libraries/SweepCurveMath.sol";
 import {
     Donor,
     GasEater,
@@ -147,15 +148,71 @@ contract BondingCurveTest is Test {
         assertEq(token.balanceOf(alice), tokensOut);
     }
 
-    /// @notice Fees come off the gross spend and land in their buckets; the whole spend, fees
-    /// included, joins the tracked quote until a sweep pays the buckets out.
-    function test_FeesComeOffTheGrossAndAccrueToTheBuckets() public {
+    /// @notice The 3% still comes off the gross spend, and is split like the pool's fee: 80% to
+    /// the strategy's treasury in the trade itself, 10% to each bucket (decision 0021). The
+    /// treasury's share leaves the tracked quote at once; the buckets stay earmarked inside it
+    /// until a sweep. The real reserve, and so the price and the graduation, is unchanged.
+    function test_FeesComeOffTheGrossAndSplitEightyTenTen() public {
         _buy(alice, 1 ether);
 
-        assertEq(curve.protocolFeeBalance(), 0.01 ether);
-        assertEq(curve.creatorFeeBalance(), 0.02 ether);
-        assertEq(curve.trackedQuote(), 1 ether);
+        assertEq(token.feesReceived(), 0.024 ether, "treasury share");
+        assertEq(curve.creatorFeeBalance(), 0.003 ether, "creator share");
+        assertEq(curve.protocolFeeBalance(), 0.003 ether, "protocol share");
+        assertEq(curve.trackedQuote(), 0.976 ether);
         assertEq(curve.realQuoteReserve(), 0.97 ether);
+        assertEq(address(curve).balance, 0.976 ether);
+    }
+
+    /// @notice The treasury's share is credited by the curve itself, inside the trade: the desk
+    /// can spend it before the transaction that paid it has been followed by any other.
+    function test_TheTreasuryShareReachesTheStrategyInTheTrade() public {
+        _buy(alice, 0.5 ether);
+
+        assertEq(token.lastFeeSender(), address(curve));
+        assertEq(address(token).balance, 0.012 ether);
+    }
+
+    /// @notice A strategy that refuses the treasury's share cannot freeze the curve: buys and sells
+    /// still trade, the share is owed on the curve instead, priced out of the reserves like the
+    /// buckets, and paid by the next sweep once the strategy takes it (audit C-1 of PR #74).
+    function test_ARefusingStrategyCannotFreezeTheCurve() public {
+        token.setRefuseFees(true);
+        uint256 bought = _buy(alice, 1 ether);
+        assertEq(curve.treasuryFeeBalance(), 0.024 ether, "the share was not owed");
+        assertEq(curve.realQuoteReserve(), 0.97 ether, "the owed share moved the price");
+
+        vm.startPrank(alice);
+        token.approve(address(curve), bought / 2);
+        curve.sell(bought / 2, 0, alice);
+        vm.stopPrank();
+        assertGt(curve.treasuryFeeBalance(), 0.024 ether);
+        assertEq(token.feesReceived(), 0);
+
+        uint256 owed = curve.treasuryFeeBalance();
+        token.setRefuseFees(false);
+        curve.sweepFees();
+        assertEq(token.feesReceived(), owed, "the sweep did not pay the owed share");
+        assertEq(curve.treasuryFeeBalance(), 0);
+    }
+
+    /// @notice A sell's fee is split the same way and the treasury is paid from it in the trade;
+    /// the seller's payout and the real reserve move exactly as before the split.
+    function test_ASellSplitsItsFeesEightyTenTen() public {
+        uint256 bought = _buy(alice, 1 ether);
+        uint256 treasuryBefore = token.feesReceived();
+        (uint256 quoteReserve, uint256 tokenReserve) = curve.getReserves();
+        uint256 gross = SweepCurveMath.getAmountOut(bought, tokenReserve, quoteReserve);
+        uint256 fees = (gross * 100) / BPS + (gross * 200) / BPS;
+        uint256 realBefore = curve.realQuoteReserve();
+
+        vm.startPrank(alice);
+        token.approve(address(curve), bought);
+        uint256 ethOut = curve.sell(bought, 0, alice);
+        vm.stopPrank();
+
+        assertEq(ethOut, gross - (gross * 100) / BPS - (gross * 200) / BPS, "payout");
+        assertEq(token.feesReceived() - treasuryBefore, (fees * 80) / 100, "treasury share");
+        assertEq(curve.realQuoteReserve(), realBefore - gross, "real reserve");
     }
 
     /// @notice A sell pays the same two fees out of the quote leg and returns the net.
@@ -301,8 +358,9 @@ contract BondingCurveTest is Test {
 
         uint256 net = 0.01 ether;
         assertEq(tokensOut, (net * SUPPLY) / (PHANTOM + net));
-        assertEq(curve.protocolFeeBalance(), 0.01 ether + 0.96 ether);
-        assertEq(curve.creatorFeeBalance(), 0.02 ether);
+        assertEq(curve.protocolFeeBalance(), 0.003 ether + 0.96 ether, "the snipe tax stays the protocol's");
+        assertEq(curve.creatorFeeBalance(), 0.003 ether);
+        assertEq(token.feesReceived(), 0.024 ether);
     }
 
     /// @notice The launcher set the terms, so taxing their own opening buy protects nobody.
@@ -313,8 +371,8 @@ contract BondingCurveTest is Test {
         vm.prank(launcher);
         curve.buy{value: 1 ether}(0, launcher);
 
-        assertEq(curve.protocolFeeBalance(), 0.01 ether);
-        assertEq(curve.creatorFeeBalance(), 0.02 ether);
+        assertEq(curve.protocolFeeBalance(), 0.003 ether);
+        assertEq(curve.creatorFeeBalance(), 0.003 ether);
     }
 
     /// @notice The creator recipient is exempt too, and separately from the launcher: on a bag
@@ -327,7 +385,7 @@ contract BondingCurveTest is Test {
         vm.prank(creator);
         curve.buy{value: 1 ether}(0, creator);
 
-        assertEq(curve.protocolFeeBalance(), 0.01 ether);
+        assertEq(curve.protocolFeeBalance(), 0.003 ether);
     }
 
     /// @notice A launch with no creator recipient exempts the launcher alone; the zero address
@@ -345,7 +403,7 @@ contract BondingCurveTest is Test {
         vm.prank(launcher);
         curve.buy{value: 1 ether}(0, alice);
 
-        assertEq(curve.protocolFeeBalance(), 0.97 ether);
+        assertEq(curve.protocolFeeBalance(), 0.963 ether);
     }
 
     /* ────────────────────── the crossing buy ────────────────────── */
@@ -481,8 +539,13 @@ contract BondingCurveTest is Test {
     /// the force-send burnt its whole 100k stipend inside the 63/64 share the self-call gets. The
     /// call gas here is those transaction limits less the 21,000 intrinsic and a 1,000 allowance
     /// for the buy's calldata, which is what reaches the curve.
+    ///
+    /// @dev Since decision 0021 the buy also sends the treasury its share, so a wallet's estimate
+    /// for the same buy is higher by that send; both limits move up by its cost, measured here as
+    /// a first-ever send to a fresh token, which bounds what it costs inside the buy.
     function test_AGasBurningCreatorCannotStarveTheCrossingBuysGraduation() public {
-        uint256[2] memory txGasLimits = [uint256(257_603), uint256(322_004)];
+        uint256 push = _treasuryPushGas();
+        uint256[2] memory txGasLimits = [uint256(257_603) + push, uint256(322_004) + push];
         for (uint256 i = 0; i < txGasLimits.length; ++i) {
             (SweepBondingCurve hostile,) = _deployCurve(address(new GasEater()));
             vm.warp(block.timestamp + 5);
@@ -521,6 +584,16 @@ contract BondingCurveTest is Test {
             vm.revertToState(snapshot);
         }
         assertGt(landed, 0, "no gas limit completed the crossing buy");
+    }
+
+    /// @dev The gas a curve's send of the treasury's share costs at most: a first-ever `addFees`
+    /// with value to a fresh token, cold account and cold slots included.
+    function _treasuryPushGas() internal returns (uint256) {
+        CurveTestToken fresh = new CurveTestToken(address(feeHook));
+        vm.deal(address(this), 1);
+        uint256 before = gasleft();
+        fresh.addFees{value: 1}();
+        return before - gasleft();
     }
 
     /// @dev True when `emitter` logged `AutoGraduationFailed` since the last `vm.recordLogs`.
@@ -589,8 +662,8 @@ contract BondingCurveTest is Test {
         vm.prank(makeAddr("stranger"));
         curve.sweepFees();
 
-        assertEq(protocolRecipient.balance, 0.01 ether);
-        assertEq(creator.balance, 0.02 ether);
+        assertEq(protocolRecipient.balance, 0.003 ether);
+        assertEq(creator.balance, 0.003 ether);
         assertEq(curve.protocolFeeBalance(), 0);
         assertEq(curve.creatorFeeBalance(), 0);
         assertEq(curve.trackedQuote(), 0.97 ether);
@@ -613,7 +686,7 @@ contract BondingCurveTest is Test {
 
         orphan.sweepFees();
 
-        assertEq(protocolRecipient.balance, 0.03 ether);
+        assertEq(protocolRecipient.balance, 0.006 ether, "both 10% shares, the treasury's 80% aside");
     }
 
     /// @notice A recipient that reverts on receive cannot hold graduation hostage, and is still

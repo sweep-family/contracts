@@ -116,9 +116,10 @@ contract BondingCurveInvariantsTest is Test {
     }
 
     /// @notice Every wei of tracked quote is a wei that came in through a buy and has not left
-    /// through a sell or a sweep. Nothing else may ever move the books.
+    /// through a sell, a sweep, or the treasury's share sent to the strategy in the trade
+    /// (decision 0021). Nothing else may ever move the books.
     function invariant_TrackedQuoteEqualsBuysMinusSellsMinusPayouts() public view {
-        uint256 paidOut = protocolRecipient.balance + creator.balance;
+        uint256 paidOut = protocolRecipient.balance + creator.balance + address(token).balance;
         assertEq(curve.trackedQuote(), handler.ghostQuoteIn() - handler.ghostQuoteOut() - paidOut);
     }
 
@@ -145,8 +146,19 @@ contract BondingCurveInvariantsTest is Test {
         assertGe(quoteReserve, PHANTOM);
     }
 
+    /// @notice The treasury's share is eight times the creator's on every trade, rounding aside:
+    /// whatever the sequence, the strategy has received at least 7.99 times what the creator was
+    /// owed and paid, and never more than 8 times plus the rounding of each trade.
+    function invariant_TheTreasuryTakesEightyOfEveryCurveFee() public view {
+        uint256 creatorShare = curve.creatorFeeBalance() + creator.balance;
+        assertGe(token.feesReceived() + 1e6, creatorShare * 8);
+        assertLe(token.feesReceived(), creatorShare * 8 + 8e6);
+    }
+
     /// @notice Fee buckets are always payable: they never exceed the tracked quote behind them.
     function invariant_TheBucketsNeverOutgrowTheTrackedQuote() public view {
-        assertLe(curve.protocolFeeBalance() + curve.creatorFeeBalance(), curve.trackedQuote());
+        assertLe(
+            curve.protocolFeeBalance() + curve.creatorFeeBalance() + curve.treasuryFeeBalance(), curve.trackedQuote()
+        );
     }
 }

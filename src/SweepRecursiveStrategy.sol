@@ -138,9 +138,11 @@ contract SweepRecursiveStrategy is SweepToken, ISweepFeeReceiver {
         __SweepToken_init(config.name, config.symbol, config.hook, config.poolManager, config.owner);
     }
 
-    /// @notice Queues a swap's fee for the next distribution.
-    /// @dev Restricted to the hook because it is the only thing that observes a swap.
-    function addFees() external payable onlyHook {
+    /// @notice Queues a trade's fee for the next distribution: a pool swap's, through the hook, or
+    /// a curve trade's, through the launch's curve (decision 0021). A curve's share waits here
+    /// until graduation, since `distribute` buys the token on the pool.
+    /// @dev Restricted to those two because they are the only things that observe a trade.
+    function addFees() external payable onlyFeeSource {
         pendingRewards += msg.value;
         emit FeesReceived(msg.value, pendingRewards);
     }

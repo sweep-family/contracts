@@ -94,6 +94,16 @@ contract CuratedLaunchTest is Test {
         assertTrue(factory.isStrategy(strategy));
     }
 
+    /// @notice Naming a creator recipient is not a way round curation: `launchWithCreator` refuses
+    /// an unadmitted collection exactly as `launch` does (decision 0022).
+    function test_ALaunchWithCreatorOnAnUnadmittedCollectionIsRefused() public {
+        vm.prank(launcher);
+        vm.expectRevert(SweepNFTStrategyFactory.TargetNotAdmitted.selector);
+        factory.launchWithCreator{value: FEE}(
+            address(collection), "Sweep", "SWP", BID_PER_SECOND, MAX_BID, address(0xC0FFEE)
+        );
+    }
+
     /// @notice A bag desk on a token the owner has not admitted is refused the same way.
     function test_AnERC20LaunchOnAnUnadmittedTokenIsRefused() public {
         vm.prank(launcher);
