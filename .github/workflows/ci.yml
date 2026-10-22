@@ -53,7 +53,7 @@ jobs:
       - name: forge test (unit, fuzz)
         run: >
           forge test -vvv
-          --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,EndToEnd,Invariants,PoolBypass,SwapRouter}.t.sol'
+          --no-match-path 'test/{Factory,FactoryERC20,FactoryRecursive,BurnRouter,BurnDepth,DeploySweep,EndToEnd,Invariants,PoolBypass,SwapRouter,CurveMachine,CurveBidLump,TokenListingRelay}.t.sol'
 
       # The coverage build turns the optimizer off, which is where a function
       # too deep for the stack first fails to compile.
